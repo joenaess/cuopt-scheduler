@@ -1,6 +1,8 @@
 streamlit
 pandas
 pulp>=2.8.0
+Faker
+plotly
 # Install cuOpt for CUDA 13
 --extra-index-url https://pypi.nvidia.com
 cuopt-server-cu13
