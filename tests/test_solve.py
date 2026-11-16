@@ -93,40 +93,44 @@ def test_gap_tolerance_is_accepted(small_feasible: Problem) -> None:
     assert solve(small_feasible, gap_rel=0.05).outcome is Outcome.OPTIMAL
 
 
-# --- classify(): solver-independent result classification -------------------------------
+# --- classify(): PuLP solve stats -> Outcome ---------------------------------------------
+
+S = pulp.LpSolveStatus
 
 
-def tiny_lp(x_value: float | None, status: int, sol_status: int) -> pulp.LpProblem:
+def tiny_lp(x_value: float | None) -> pulp.LpProblem:
     lp = pulp.LpProblem("t", pulp.LpMinimize)
-    x = pulp.LpVariable("x", cat=pulp.LpBinary)
+    x = lp.add_variable("x", cat="Binary")
     lp += x
     lp += x >= 1
     x.varValue = x_value
-    lp.assignStatus(status, sol_status)
     return lp
 
 
-def test_classify_optimal() -> None:
-    lp = tiny_lp(1, pulp.LpStatusOptimal, pulp.LpSolutionOptimal)
-    assert classify(lp) is Outcome.OPTIMAL
+def stats(status: pulp.LpSolveStatus, has_solution: bool) -> pulp.LpSolveStats:
+    return pulp.LpSolveStats(status=status, has_solution=has_solution)
 
 
-def test_classify_cbc_time_limit_with_solution() -> None:
-    # CBC: status "Optimal" but only an integer-feasible solution.
-    lp = tiny_lp(1, pulp.LpStatusOptimal, pulp.LpSolutionIntegerFeasible)
-    assert classify(lp) is Outcome.FEASIBLE
-
-
-def test_classify_cuopt_time_limit_with_solution() -> None:
-    # PuLP's cuOpt adapter: "Not Solved", but valid values loaded.
-    lp = tiny_lp(1, pulp.LpStatusNotSolved, pulp.LpSolutionNoSolutionFound)
-    assert classify(lp) is Outcome.FEASIBLE
+@pytest.mark.parametrize(
+    ("status", "has_solution", "expected"),
+    [
+        (S.Optimal, True, Outcome.OPTIMAL),
+        (S.GapLimit, True, Outcome.OPTIMAL),  # within the requested gap
+        (S.TimeLimit, True, Outcome.FEASIBLE),
+        (S.Stopped, True, Outcome.FEASIBLE),  # cuOpt "FeasibleFound"
+        (S.TimeLimit, False, Outcome.NO_SOLUTION),
+        (S.Infeasible, False, Outcome.NO_SOLUTION),
+    ],
+)
+def test_classify_status(status: pulp.LpSolveStatus, has_solution: bool, expected: Outcome) -> None:
+    assert classify(tiny_lp(1), stats(status, has_solution)) is expected
 
 
 @pytest.mark.parametrize("value", [None, 0, 0.5])
-def test_classify_rejects_missing_invalid_or_fractional(value: float | None) -> None:
-    lp = tiny_lp(value, pulp.LpStatusNotSolved, pulp.LpSolutionNoSolutionFound)
-    assert classify(lp) is Outcome.NO_SOLUTION
+def test_classify_rejects_claimed_solution_that_is_missing_invalid_or_fractional(
+    value: float | None,
+) -> None:
+    assert classify(tiny_lp(value), stats(S.Optimal, True)) is Outcome.NO_SOLUTION
 
 
 # --- properties ---------------------------------------------------------------------------

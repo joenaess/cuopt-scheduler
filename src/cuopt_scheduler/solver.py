@@ -32,7 +32,7 @@ class Outcome(StrEnum):
 class SolveResult:
     outcome: Outcome
     solver_status: str
-    """Raw PuLP status string, for diagnostics."""
+    """PuLP's stop reason (e.g. "Optimal", "TimeLimit"), for diagnostics."""
     backend: Backend
     """The backend that actually produced the result."""
     solve_seconds: float
@@ -56,9 +56,10 @@ def cuopt_available() -> bool:
 class _CUOPT(pulp.CUOPT):
     """pulp.CUOPT that passes cuOpt parameters through.
 
-    PuLP 3.3's adapter drops every extra parameter except `optimality_tolerance`, and maps
-    `gapRel` to cuOpt's LP-only `relative_gap_tolerance`, so a MIP gap never reaches cuOpt.
-    Only `callSolver` is replaced; revisit when moving to PuLP 4.
+    PuLP's adapter (still as of 4.2) drops every extra parameter except
+    `optimality_tolerance`, and maps `gapRel` to cuOpt's LP-only `relative_gap_tolerance`,
+    so a MIP gap never reaches cuOpt. Only `callSolver` is replaced; check on PuLP upgrades
+    whether this is still needed.
     """
 
     def __init__(
@@ -78,7 +79,7 @@ class _CUOPT(pulp.CUOPT):
         for key, value in self.cuopt_params.items():
             settings.set_parameter(key, value)
         start = time.perf_counter()
-        solution = solver.Solve(lp.solverModel, settings)  # pyright: ignore[reportAttributeAccessIssue]
+        solution = solver.Solve(lp.solverModel, settings)
         self.solveTime = time.perf_counter() - start
         return solution
 
@@ -87,29 +88,30 @@ def _solver(backend: Backend, time_limit: float, gap_rel: float | None) -> pulp.
     if backend is Backend.GPU:
         params = {} if gap_rel is None else {"mip_relative_gap": gap_rel}
         return _CUOPT(params, msg=False, timeLimit=time_limit)
-    # PuLP 3.x re-exports via `import *` and a Rust core, which pyright cannot follow.
-    return pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit, gapRel=gap_rel)  # pyright: ignore[reportAttributeAccessIssue]
+    return pulp.COIN_CMD(msg=False, timeLimit=time_limit, gapRel=gap_rel)
 
 
-def classify(lp: pulp.LpProblem, tol: float = 1e-6) -> Outcome:
-    """Classify a solved model without trusting solver-specific status codes.
+# Stop reasons that mean "proven optimal", possibly within the requested gap.
+_PROVEN = {pulp.LpSolveStatus.Optimal, pulp.LpSolveStatus.GapLimit}
 
-    CBC reports a time-limited run with a solution as "Optimal" (only `sol_status` says it
-    isn't proven), and PuLP's cuOpt adapter reports it as "Not Solved" while still loading
-    the values. So: a result is usable if every variable has an integral value and every
-    constraint holds; it is optimal only if the solver also proved optimality.
+
+def classify(lp: pulp.LpProblem, stats: pulp.LpSolveStats, tol: float = 1e-6) -> Outcome:
+    """Turn PuLP's solve stats into an Outcome.
+
+    A returned solution is also checked against the model (values present, integral, every
+    constraint holds), so a solver-adapter bug can't pass off an invalid schedule.
     """
+    if not stats.has_solution:
+        return Outcome.NO_SOLUTION
     for v in lp.variables():
         value = v.varValue
         if value is None:
             return Outcome.NO_SOLUTION
         if v.cat == pulp.LpInteger and abs(value - round(value)) > tol:
             return Outcome.NO_SOLUTION
-    # PuLP annotates eps as int, but it is compared against float slacks.
-    if not lp.valid(tol):  # pyright: ignore[reportArgumentType]
+    if not lp.valid(tol):
         return Outcome.NO_SOLUTION
-    proven = lp.status == pulp.LpStatusOptimal and lp.sol_status == pulp.LpSolutionOptimal  # pyright: ignore[reportAttributeAccessIssue]
-    return Outcome.OPTIMAL if proven else Outcome.FEASIBLE
+    return Outcome.OPTIMAL if stats.status in _PROVEN else Outcome.FEASIBLE
 
 
 def solve(
@@ -130,17 +132,17 @@ def solve(
 
     start = time.perf_counter()
     try:
-        model.lp.solve(_solver(backend, time_limit, gap_rel))
+        stats = model.lp.solve(_solver(backend, time_limit, gap_rel))
     except Exception as exc:
         if backend is Backend.CPU:
             raise
         warnings.append(f"cuOpt failed ({exc}); solved on CPU instead.")
         backend = Backend.CPU
         start = time.perf_counter()
-        model.lp.solve(_solver(backend, time_limit, gap_rel))
+        stats = model.lp.solve(_solver(backend, time_limit, gap_rel))
     elapsed = time.perf_counter() - start
 
-    outcome = classify(model.lp)
+    outcome = classify(model.lp, stats)
     assignments: tuple[Assignment, ...] = ()
     objective = None
     if outcome is not Outcome.NO_SOLUTION:
@@ -154,7 +156,7 @@ def solve(
         objective = model.lp.objective.value() if model.lp.objective else None
     return SolveResult(
         outcome=outcome,
-        solver_status=pulp.LpStatus[model.lp.status],  # pyright: ignore[reportAttributeAccessIssue]
+        solver_status=stats.status.name,
         backend=backend,
         solve_seconds=elapsed,
         objective=objective,

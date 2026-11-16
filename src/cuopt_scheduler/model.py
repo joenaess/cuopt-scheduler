@@ -37,20 +37,20 @@ def rest_conflicts(problem: Problem) -> Iterator[tuple[str, str]]:
 
 def build_model(problem: Problem) -> ScheduleModel:
     shifts, days = problem.shifts, problem.days
+    lp = pulp.LpProblem("Nurse_Scheduling", pulp.LpMinimize)
     x = {
-        (e.id, s, d): pulp.LpVariable(f"assign_{e.id}_{s}_d{d}", cat=pulp.LpBinary)
+        (e.id, s, d): lp.add_variable(f"assign_{e.id}_{s}_d{d}", cat="Binary")
         for e in problem.employees
         for s in shifts
         for d in days
     }
     uncovered = {
-        (d, s, skill): pulp.LpVariable(f"uncovered_{s}_{skill}_d{d}", lowBound=0)
+        (d, s, skill): lp.add_variable(f"uncovered_{s}_{skill}_d{d}", lowBound=0)
         for d in days
         for s in shifts
         for skill in problem.demand[s]
     }
 
-    lp = pulp.LpProblem("Nurse_Scheduling", pulp.LpMinimize)
     # Objective: cover as much demand as possible, then use as few shifts as possible.
     lp += UNCOVERED_PENALTY * pulp.lpSum(uncovered.values()) + pulp.lpSum(x.values()), "cost"
 

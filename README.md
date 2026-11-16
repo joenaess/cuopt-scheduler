@@ -4,7 +4,7 @@ A high-performance, GPU-accelerated staff scheduling application powered by **NV
 
 This project solves a nurse rostering problem as a mixed-integer program, on a local NVIDIA GPU with cuOpt or on the CPU with CBC, and includes a benchmark to compare the two honestly (see [GPU vs CPU](#-gpu-vs-cpu)).
 
-![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
+![Python](https://img.shields.io/badge/Python-3.12%2B-blue)
 ![NVIDIA](https://img.shields.io/badge/NVIDIA-cuOpt-green)
 ![Streamlit](https://img.shields.io/badge/Framework-Streamlit-red)
 
@@ -24,7 +24,7 @@ This project solves a nurse rostering problem as a mixed-integer program, on a l
 
 ## 🛠️ Prerequisites
 
-* **Python:** 3.11+ and [uv](https://docs.astral.sh/uv/).
+* **Python:** 3.12+ and [uv](https://docs.astral.sh/uv/).
 * **For the GPU solver (optional):** Linux or WSL2, an NVIDIA GPU (RTX 30/40-series recommended) and drivers supporting CUDA 13. Without one the app runs on the CPU solver (CBC).
 
 ## 📦 Installation
