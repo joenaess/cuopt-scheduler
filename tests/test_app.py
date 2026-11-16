@@ -7,32 +7,56 @@ from streamlit.testing.v1 import AppTest
 APP = str(Path(__file__).parent.parent / "app.py")
 
 
+def app() -> AppTest:
+    return AppTest.from_file(APP, default_timeout=60).run()
+
+
 def force_cpu(at: AppTest) -> None:
     # Without cuOpt the toggle is already off and disabled.
     if not at.toggle[0].disabled:
         at.toggle[0].set_value(False)
 
 
+def slider(at: AppTest, label: str):
+    return next(s for s in at.slider if s.label.startswith(label))
+
+
 def test_initial_page_shows_preview() -> None:
-    at = AppTest.from_file(APP).run()
+    at = app()
     assert not at.exception
     assert len(at.dataframe) == 2
 
 
-def test_generate_and_solve_on_cpu() -> None:
-    at = AppTest.from_file(APP, default_timeout=60).run()
-    at.slider[0].set_value(80)
+def test_default_settings_cover_all_demand() -> None:
+    at = app()
     force_cpu(at)
     at.button[0].click().run()
     assert not at.exception
-    assert at.success and "CPU (CBC)" in at.success[0].value
+    assert at.success and "Optimal schedule found with CPU (CBC)" in at.success[0].value
+    assert not at.warning
     assert len(at.tabs) == 3
 
 
-def test_infeasible_shows_error() -> None:
-    at = AppTest.from_file(APP, default_timeout=60).run()
-    at.slider[0].set_value(10)
+def test_understaffed_shows_uncovered_slots() -> None:
+    at = app()
+    slider(at, "Number of Employees").set_value(20)
     force_cpu(at)
     at.button[0].click().run()
     assert not at.exception
-    assert at.error and "Infeasible" in at.error[0].value
+    assert any("could not be covered" in w.value for w in at.warning)
+    assert any("Missing" in df.value.columns for df in at.dataframe)
+
+
+def test_compare_backends_when_gpu_available() -> None:
+    import pytest
+
+    from cuopt_scheduler import cuopt_available
+
+    if not cuopt_available():
+        pytest.skip("cuOpt / NVIDIA GPU not available")
+    at = app()
+    at.checkbox[0].check()
+    at.button[0].click().run()
+    assert not at.exception
+    table = next(df.value for df in at.dataframe if "Solver" in df.value.columns)
+    assert len(table) == 2

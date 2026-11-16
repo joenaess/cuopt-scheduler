@@ -1,7 +1,7 @@
 import pytest
 
 from cuopt_scheduler import Problem, generate_problem
-from cuopt_scheduler.data import SHIFTS, SKILLS
+from cuopt_scheduler.data import DEFAULT_DEMAND, SHIFTS, SKILLS
 
 from .conftest import rn
 
@@ -21,8 +21,15 @@ def test_shape_and_value_ranges() -> None:
     assert p.shifts == SHIFTS
     for e in p.employees:
         assert e.skill in SKILLS
-        assert e.max_hours in (24, 32, 40)
+        assert e.max_weekly_hours in (24, 32, 40)
         assert all(d in p.days and s in SHIFTS for d, s in e.unavailable)
+
+
+def test_wards_scale_demand() -> None:
+    p = generate_problem(10, 7, seed=0, wards=3)
+    assert p.demand["Day"]["CNA"] == 3 * DEFAULT_DEMAND["Day"]["CNA"]
+    with pytest.raises(ValueError, match="wards"):
+        generate_problem(10, 7, wards=0)
 
 
 def test_ids_unique_even_when_names_collide() -> None:
@@ -30,6 +37,20 @@ def test_ids_unique_even_when_names_collide() -> None:
     for seed in range(50):
         p = generate_problem(100, 7, seed=seed)
         assert len({e.id for e in p.employees}) == 100
+
+
+@pytest.mark.parametrize(
+    ("days", "weeks"),
+    [(1, [range(0, 1)]), (7, [range(0, 7)]), (10, [range(0, 7), range(7, 10)])],
+)
+def test_weeks(days: int, weeks: list[range]) -> None:
+    assert Problem(employees=(rn("A"),), num_days=days).weeks == weeks
+
+
+def test_start_hour_is_absolute() -> None:
+    p = Problem(employees=(rn("A"),), num_days=3)
+    assert p.start_hour(0, "Day") == 7
+    assert p.start_hour(2, "Night") == 48 + 23
 
 
 def test_problem_rejects_duplicate_ids() -> None:
@@ -40,3 +61,8 @@ def test_problem_rejects_duplicate_ids() -> None:
 def test_problem_rejects_empty_horizon() -> None:
     with pytest.raises(ValueError, match="num_days"):
         Problem(employees=(rn("A"),), num_days=0)
+
+
+def test_problem_rejects_shift_without_start_time() -> None:
+    with pytest.raises(ValueError, match="Brunch"):
+        Problem(employees=(rn("A"),), num_days=1, demand={"Brunch": {"RN": 1}})

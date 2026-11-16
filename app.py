@@ -1,9 +1,20 @@
 """Streamlit UI. All scheduling logic lives in the cuopt_scheduler package."""
 
+import dataclasses
+
+import pandas as pd
 import streamlit as st
 
-from cuopt_scheduler import Backend, cuopt_available, generate_problem, solve
-from cuopt_scheduler.frames import demand_frame, employees_frame, schedule_frame
+from cuopt_scheduler import (
+    Backend,
+    Outcome,
+    SolveResult,
+    coverage_gaps,
+    cuopt_available,
+    generate_problem,
+    solve,
+)
+from cuopt_scheduler.frames import demand_frame, employees_frame, gaps_frame, schedule_frame
 from cuopt_scheduler.viz import coverage_figure, gantt_figure
 
 st.set_page_config(page_title="NVIDIA cuOpt Scheduler", layout="wide")
@@ -12,13 +23,28 @@ st.caption("Powered by NVIDIA cuOpt & Streamlit")
 
 with st.sidebar:
     st.header("1. Data Generation")
-    num_emp = st.slider("Number of Employees", 10, 100, 25)
-    duration = st.slider("Schedule Duration (Days)", 7, 21, 7)
+    wards = st.slider("Wards", 1, 20, 1, help="Each ward adds 15 staff slots per day.")
+    num_emp = st.slider(
+        "Number of Employees", 10, 1000, 45, help="About 45 per ward covers all demand."
+    )
+    duration = st.slider("Schedule Duration (Days)", 7, 28, 7)
     seed = st.number_input("Random seed", min_value=0, value=42, step=1)
 
     st.divider()
 
-    st.header("2. Optimization Settings")
+    st.header("2. Rules")
+    min_rest = st.slider(
+        "Minimum rest between shifts (hours)",
+        0,
+        16,
+        11,
+        help="11h rules out Night→Day and Evening→Day on consecutive days.",
+    )
+    st.caption("Max hours apply per calendar week (24, 32 or 40 per employee).")
+
+    st.divider()
+
+    st.header("3. Optimization Settings")
     gpu_ok = cuopt_available()
     use_gpu = st.toggle(
         "Use NVIDIA GPU (cuOpt)",
@@ -26,23 +52,37 @@ with st.sidebar:
         disabled=not gpu_ok,
         help=None if gpu_ok else "cuOpt not available. Install with `uv sync --extra gpu`.",
     )
-
-    st.info("""
-    **What can I alter in this simulation?**
-
-    In a real deployment, you can adjust:
-    * **Staffing Rules:** Min/Max staff per shift.
-    * **Skills:** Required certifications (RN vs CNA).
-    * **Constraints:** Max overtime, union rules, consecutive work days.
-    * **Objectives:** Minimize cost vs. Maximize employee preference.
-    """)
+    compare = st.checkbox(
+        "Also solve on the other backend and compare",
+        disabled=not gpu_ok,
+        help="Solves the same problem on CPU and GPU.",
+    )
+    time_limit = st.slider("Time limit (seconds)", 5, 120, 30)
+    gap_pct = st.number_input(
+        "Stop within this % of optimal",
+        min_value=0.0,
+        max_value=10.0,
+        value=0.0,
+        step=0.5,
+        help="0 = solver default. A small gap often saves a lot of time.",
+    )
 
     if st.button("Generate & Solve", type="primary"):
-        problem = generate_problem(num_emp, duration, seed=int(seed))
-        with st.spinner("Optimizing schedule..."):
-            result = solve(problem, Backend.GPU if use_gpu else Backend.CPU)
+        problem = dataclasses.replace(
+            generate_problem(num_emp, duration, seed=int(seed), wards=wards),
+            min_rest_hours=min_rest,
+        )
+        primary = Backend.GPU if use_gpu else Backend.CPU
+        backends = [primary]
+        if compare and gpu_ok:
+            backends.append(Backend.CPU if use_gpu else Backend.GPU)
+        gap = gap_pct / 100 or None
+        results: list[SolveResult] = []
+        for backend in backends:
+            with st.spinner(f"Optimizing schedule on {backend.upper()}..."):
+                results.append(solve(problem, backend, time_limit=time_limit, gap_rel=gap))
         # Keep results across reruns (e.g. clicking the download button).
-        st.session_state["run"] = (problem, result)
+        st.session_state["run"] = (problem, results)
 
 run = st.session_state.get("run")
 if run is None:
@@ -52,25 +92,60 @@ if run is None:
     col1, col2 = st.columns(2)
     with col1:
         st.write("**Employee Pool (Sample)**")
-        st.dataframe(employees_frame(preview)[["Name", "Skill", "Max_Hours"]])
+        st.dataframe(employees_frame(preview)[["Name", "Skill", "Max_Hours_Per_Week"]])
     with col2:
-        st.write("**Shift Requirements (staff per shift)**")
+        st.write("**Shift Requirements (staff per shift, per ward)**")
         st.dataframe(demand_frame(preview))
     st.stop()
 
-problem, result = run
+problem, results = run
+result = results[0]
+
+
+def engine(r: SolveResult) -> str:
+    return "🚀 NVIDIA cuOpt" if r.backend is Backend.GPU else "CPU (CBC)"
+
+
 for warning in result.warnings:
     st.warning(warning)
 
-if not result.feasible:
+if len(results) > 1:
+    st.subheader("CPU vs GPU")
+    st.dataframe(
+        pd.DataFrame(
+            {
+                "Solver": engine(r),
+                "Outcome": r.outcome.value,
+                "Seconds": round(r.solve_seconds, 3),
+                "Objective": r.objective,
+                "Uncovered slots": sum(coverage_gaps(problem, r.assignments).values())
+                if r.feasible
+                else None,
+            }
+            for r in results
+        ),
+        hide_index=True,
+    )
+
+if result.outcome is Outcome.NO_SOLUTION:
     st.error(
-        f"Optimization failed ({result.status}). The constraints might be too tight, "
-        "e.g. not enough staff for the required shifts. Try increasing the employee count."
+        f"No schedule found within {time_limit} seconds ({result.solver_status}). "
+        "Try a longer time limit, a gap tolerance, or the other solver."
     )
     st.stop()
 
-engine = "🚀 NVIDIA cuOpt" if result.backend is Backend.GPU else "CPU (CBC)"
-st.success(f"Solved with {engine} in {result.solve_seconds:.4f} seconds!")
+took = f"with {engine(result)} in {result.solve_seconds:.3f} seconds"
+if result.outcome is Outcome.OPTIMAL:
+    st.success(f"Optimal schedule found {took}.")
+else:
+    st.warning(f"Time limit reached: best schedule found {took}, not proven optimal.")
+
+gaps = coverage_gaps(problem, result.assignments)
+if gaps:
+    st.warning(
+        f"{sum(gaps.values())} required staff slots could not be covered with the available "
+        "staff. See **Coverage Analysis**."
+    )
 
 schedule = schedule_frame(problem, result.assignments)
 tab1, tab2, tab3 = st.tabs(
@@ -79,13 +154,20 @@ tab1, tab2, tab3 = st.tabs(
 
 with tab1:
     st.subheader("Employee Schedule Timeline")
-    st.plotly_chart(gantt_figure(schedule), width="stretch")
+    if schedule.empty:
+        st.info("Nobody is scheduled.")
+    else:
+        st.plotly_chart(gantt_figure(schedule), width="stretch")
 
 with tab2:
-    st.subheader("Shift Coverage Heatmap")
-    st.plotly_chart(coverage_figure(schedule, list(problem.shifts)), width="stretch")
-    st.markdown("**Skill Breakdown:**")
-    st.bar_chart(schedule["Skill"].value_counts())
+    if gaps:
+        st.subheader("Uncovered Staff Slots")
+        st.dataframe(gaps_frame(problem, gaps), hide_index=True, width="stretch")
+    if not schedule.empty:
+        st.subheader("Shift Coverage Heatmap")
+        st.plotly_chart(coverage_figure(schedule, list(problem.shifts)), width="stretch")
+        st.markdown("**Skill Breakdown:**")
+        st.bar_chart(schedule["Skill"].value_counts())
 
 with tab3:
     export = schedule[
