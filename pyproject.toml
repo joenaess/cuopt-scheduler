@@ -12,6 +12,9 @@ dependencies = [
     "streamlit>=1.50",
 ]
 
+[project.scripts]
+cuopt-bench = "cuopt_scheduler.benchmark:main"
+
 [project.optional-dependencies]
 # PuLP's CUOPT solver uses the cuOpt Python library (not the REST server).
 gpu = ["cuopt-cu13==25.10.*; sys_platform == 'linux'"]

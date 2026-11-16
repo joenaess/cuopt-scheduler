@@ -21,6 +21,8 @@ SKILL_LABELS: Mapping[str, str] = MappingProxyType(
 SHIFTS: tuple[str, ...] = ("Day", "Evening", "Night")
 SHIFT_START_HOUR: Mapping[str, int] = MappingProxyType({"Day": 7, "Evening": 15, "Night": 23})
 SHIFT_LENGTH_HOURS = 8
+MIN_REST_HOURS = 11  # common working-time rule (e.g. EU Working Time Directive)
+DAYS_PER_WEEK = 7
 
 # Staff needed per shift and skill. Same every day.
 DEFAULT_DEMAND: Mapping[str, Mapping[str, int]] = MappingProxyType(
@@ -37,7 +39,7 @@ class Employee:
     id: str
     name: str
     skill: str
-    max_hours: int
+    max_weekly_hours: int
     unavailable: frozenset[tuple[int, str]] = field(default_factory=frozenset)
     """(day, shift) pairs the employee cannot work."""
 
@@ -51,6 +53,10 @@ class Problem:
     num_days: int
     demand: Mapping[str, Mapping[str, int]] = field(default_factory=lambda: DEFAULT_DEMAND)
     shift_length: int = SHIFT_LENGTH_HOURS
+    shift_start: Mapping[str, int] = field(default_factory=lambda: SHIFT_START_HOUR)
+    """Start hour (0-23) of each shift. A shift may run past midnight."""
+    min_rest_hours: int = MIN_REST_HOURS
+    """Minimum hours off between the end of one shift and the start of the next."""
 
     def __post_init__(self) -> None:
         ids = [e.id for e in self.employees]
@@ -58,6 +64,8 @@ class Problem:
             raise ValueError("employee ids must be unique")
         if self.num_days < 1:
             raise ValueError("num_days must be >= 1")
+        if missing := set(self.demand) - set(self.shift_start):
+            raise ValueError(f"no start hour for shifts {sorted(missing)}")
 
     @property
     def shifts(self) -> tuple[str, ...]:
@@ -67,6 +75,18 @@ class Problem:
     def days(self) -> range:
         return range(self.num_days)
 
+    @property
+    def weeks(self) -> list[range]:
+        """Days split into weeks of 7; the last week may be shorter."""
+        return [
+            range(start, min(start + DAYS_PER_WEEK, self.num_days))
+            for start in range(0, self.num_days, DAYS_PER_WEEK)
+        ]
+
+    def start_hour(self, day: int, shift: str) -> int:
+        """Absolute start time in hours from the beginning of day 0."""
+        return 24 * day + self.shift_start[shift]
+
     def employee(self, employee_id: str) -> Employee:
         return self._by_id[employee_id]
 
@@ -75,8 +95,16 @@ class Problem:
         return {e.id: e for e in self.employees}
 
 
-def generate_problem(num_employees: int, num_days: int, *, seed: int | None = None) -> Problem:
-    """Generate a random workforce. The same seed always gives the same problem."""
+def generate_problem(
+    num_employees: int, num_days: int, *, seed: int | None = None, wards: int = 1
+) -> Problem:
+    """Generate a random workforce. The same seed always gives the same problem.
+
+    `wards` multiplies the staffing demand (one ward needs DEFAULT_DEMAND). Roughly 45
+    employees per ward cover all demand; fewer leave gaps.
+    """
+    if wards < 1:
+        raise ValueError("wards must be >= 1")
     rng = random.Random(seed)
     fake = Faker()
     fake.seed_instance(rng.getrandbits(32))
@@ -99,8 +127,16 @@ def generate_problem(num_employees: int, num_days: int, *, seed: int | None = No
                 id=f"E{i + 1:03d}",
                 name=f"{fake.first_name()} {fake.last_name()}",
                 skill=skill,
-                max_hours=max_hours,
+                max_weekly_hours=max_hours,
                 unavailable=frozenset(unavailable),
             )
         )
-    return Problem(employees=tuple(employees), num_days=num_days)
+    demand = {s: {k: v * wards for k, v in need.items()} for s, need in DEFAULT_DEMAND.items()}
+    return Problem(employees=tuple(employees), num_days=num_days, demand=demand)
+
+
+@dataclass(frozen=True, order=True)
+class Assignment:
+    day: int
+    shift: str
+    employee_id: str

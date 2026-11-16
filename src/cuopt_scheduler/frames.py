@@ -6,8 +6,8 @@ from collections.abc import Iterable
 
 import pandas as pd
 
-from cuopt_scheduler.data import SHIFT_START_HOUR, SKILL_LABELS, Problem
-from cuopt_scheduler.solver import Assignment
+from cuopt_scheduler.data import SKILL_LABELS, Assignment, Problem
+from cuopt_scheduler.validate import Gaps
 
 # A Monday, so day 0 is Mon in both the labels and the Gantt axis.
 BASE_DATE = pd.Timestamp("2024-01-01")
@@ -24,7 +24,7 @@ def employees_frame(problem: Problem) -> pd.DataFrame:
             "ID": e.id,
             "Name": e.name,
             "Skill": SKILL_LABELS.get(e.skill, e.skill),
-            "Max_Hours": e.max_hours,
+            "Max_Hours_Per_Week": e.max_weekly_hours,
             "Days_Off": sum(
                 all(not e.is_available(d, s) for s in problem.shifts) for d in problem.days
             ),
@@ -44,7 +44,7 @@ def schedule_frame(problem: Problem, assignments: Iterable[Assignment]) -> pd.Da
     rows = []
     for a in sorted(assignments):
         emp = problem.employee(a.employee_id)
-        start = BASE_DATE + pd.Timedelta(days=a.day, hours=SHIFT_START_HOUR.get(a.shift, 0))
+        start = BASE_DATE + pd.Timedelta(hours=problem.start_hour(a.day, a.shift))
         rows.append(
             {
                 "Day_Index": a.day,
@@ -59,3 +59,18 @@ def schedule_frame(problem: Problem, assignments: Iterable[Assignment]) -> pd.Da
         )
     columns = ["Day_Index", "Day", "Shift", "Employee_ID", "Employee", "Skill"]
     return pd.DataFrame(rows, columns=pd.Index([*columns, "Start_Time", "End_Time"]))
+
+
+def gaps_frame(problem: Problem, gaps: Gaps) -> pd.DataFrame:
+    """One row per (day, shift, skill) that is short of staff."""
+    rows = [
+        {
+            "Day": day_label(d),
+            "Shift": s,
+            "Skill": SKILL_LABELS.get(skill, skill),
+            "Required": problem.demand[s][skill],
+            "Missing": missing,
+        }
+        for (d, s, skill), missing in sorted(gaps.items())
+    ]
+    return pd.DataFrame(rows, columns=pd.Index(["Day", "Shift", "Skill", "Required", "Missing"]))
