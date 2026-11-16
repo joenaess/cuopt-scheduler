@@ -4,13 +4,13 @@ A high-performance, GPU-accelerated staff scheduling application powered by **NV
 
 This project demonstrates how to solve complex combinatorial optimization problems (like nurse rostering) in seconds using the massive parallel processing power of local NVIDIA GPUs (Ampere/Ada Lovelace architectures).
 
-![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
+![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
 ![NVIDIA](https://img.shields.io/badge/NVIDIA-cuOpt-green)
 ![Streamlit](https://img.shields.io/badge/Framework-Streamlit-red)
 
 ## 🚀 Features
 
-* **GPU Acceleration:** Utilizes NVIDIA cuOpt (via PuLP) to solve scheduling problems significantly faster than traditional CPU solvers (CBC/GLPK).
+* **GPU Acceleration:** Solves with NVIDIA cuOpt via PuLP, with automatic fallback to CBC on CPU. At the demo's default sizes CBC is still faster; cuOpt pays off on larger problems.
 * **Realistic Simulation:** Generates "fake" but realistic employee profiles (names, skills, availability) using `Faker`.
 * **Interactive Visualization:**
 
@@ -23,100 +23,72 @@ This project demonstrates how to solve complex combinatorial optimization proble
 
 ## 🛠️ Prerequisites
 
-* **Hardware:** NVIDIA GPU (RTX 30-series or 40-series recommended).
-* **OS:** Linux (Tested on Pop!_OS) or WSL2.
-* **Drivers:** NVIDIA Drivers (535+) and CUDA Toolkit 12/13.
-* **Python:** Version 3.10 or higher.
+* **Python:** 3.11+ and [uv](https://docs.astral.sh/uv/).
+* **For the GPU solver (optional):** Linux or WSL2, an NVIDIA GPU (RTX 30/40-series recommended) and drivers supporting CUDA 13. Without one the app runs on the CPU solver (CBC).
 
 ## 📦 Installation
 
-1. **Clone or Create Directory**
+```bash
+git clone <this repo> && cd cuopt-scheduler
+uv sync --extra gpu   # with NVIDIA cuOpt
+uv sync               # CPU only
+```
 
-    ```bash
-    mkdir ~/cuopt-scheduler
-    cd ~/cuopt-scheduler
-    ```
-
-2. **Set up Virtual Environment**
-
-    ```bash
-    python3 -m venv .venv
-    source .venv/bin/activate
-    ```
-
-3. **Install Dependencies**
-    Note: We must point to the NVIDIA PyPI index to get the optimized `cuopt` binaries.
-  
-    *Create a `requirements.txt` with the following content:*
-
-    ```text
-    streamlit
-    pandas
-    pulp>=2.8.0
-    Faker
-    plotly
-    --extra-index-url [https://pypi.nvidia.com](https://pypi.nvidia.com)
-    cuopt-server-cu13
-    cuopt-sh-client
-    ```
-
-    *Then run:*
-
-    ```bash
-    pip install -r requirements.txt
-    ```
+The NVIDIA package index is configured in `pyproject.toml`, and `uv.lock` pins every version.
 
 ## 🖥️ Usage
 
-1. **Activate Environment** (if not already active)
+```bash
+uv run streamlit run app.py
+```
 
-    ```bash
-    source .venv/bin/activate
-    ```
+* Open `http://localhost:8501`.
+* In the **Sidebar**, set the number of employees, the schedule length and a random seed (same seed, same data).
+* Toggle **"Use NVIDIA GPU"** to compare against the CPU solver. It is disabled when cuOpt is not available.
+* Click **Generate & Solve**.
 
-2. **Run the Application**
+## 🧪 Development
 
-    ```bash
-    streamlit run app.py
-    ```
+```bash
+uv run pytest                  # tests; GPU tests skip automatically without cuOpt
+uv run ruff format . && uv run ruff check .
+uv run pyright
+```
 
-3. **Interact**
-    * Open your browser to `http://localhost:8501`.
-    * Use the **Sidebar** to adjust the number of employees and simulation duration.
-    * Toggle **"Use NVIDIA GPU"** to compare performance against the CPU solver.
-    * Click **Generate & Solve**.
+CI (`.github/workflows/ci.yml`) runs the same checks on every pull request, on CPU only.
+
+The tests check every solution against `cuopt_scheduler.validate.violations`, an independent rule checker that doesn't reuse the model. They include property-based tests (Hypothesis) over generated problems and headless Streamlit tests (`AppTest`).
 
 ## 📂 Project Structure
 
 ```text
 cuopt-scheduler/
-├── app.py              # Main application logic (UI, Solver, Viz)
-├── requirements.txt    # Python dependencies
-├── README.md           # Project documentation
-└── data/               # Directory for generated CSVs (optional)
+├── app.py                    # Streamlit UI only
+├── src/cuopt_scheduler/
+│   ├── data.py               # Problem definition and synthetic data generation
+│   ├── model.py              # MILP formulation (PuLP)
+│   ├── solver.py             # CPU/GPU solving with fallback
+│   ├── validate.py           # Independent schedule checker
+│   ├── frames.py             # DataFrames for display and CSV export
+│   └── viz.py                # Plotly figures
+├── tests/
+├── pyproject.toml / uv.lock
+└── README.md
 ```
 
 ## 🧠 How It Works
 
-1.**Data Generation**: The app creates a synthetic workforce with randomized availability and skills (RN, LPN, CNA).
-
-2.**Modeling**: The problem is formulated as a Mixed-Integer Linear Program (MILP) using PuLP.
-
-* *Objective*: Minimize total assigned shifts (or maximize efficiency).
-
-* *Constraints*: Staffing demand, max hours, availability, no double-booking.
-
-3.**Solving**: * If GPU is selected, PuLP delegates the matrix calculations to cuopt-server, utilizing CUDA cores for rapid convergence.
-
-* *If CPU is selected*, it falls back to the default CBC solver.
-
-4.**Visualization**: Results are parsed into Pandas DataFrames and rendered using Plotly.
+1. **Data Generation**: Creates a synthetic workforce with random availability and skills (RN, LPN, CNA).
+2. **Modeling**: Formulates the problem as a Mixed-Integer Linear Program (MILP) with PuLP.
+   * *Objective*: Minimize total assigned shifts.
+   * *Constraints*: Staffing demand per skill, max hours, availability, at most one shift per day.
+3. **Solving**: On GPU, PuLP hands the model to the cuOpt library. On CPU, or if cuOpt is unavailable, it uses CBC.
+4. **Visualization**: Results become pandas DataFrames rendered with Plotly.
 
 ## ⚠️ Troubleshooting
 
-"pulp.CUOPT not detected": Ensure you have installed the specific cuopt packages from the NVIDIA index URL. Check that your pulp version is >= 2.8.0.
-
-Optimization Infeasible: If the solver returns "Infeasible," try increasing the Number of Employees in the sidebar. The constraints might be too tight (e.g., needing 5 RNs but only generating 3).
+* **GPU toggle is disabled**: cuOpt isn't available. Run `uv sync --extra gpu` and check `nvidia-smi`.
+* **"Infeasible"**: The constraints are too tight for the generated staff. With 7 days you need roughly 40+ employees, and more for longer schedules, because the hour cap currently applies to the whole period rather than per week.
 
 ## 📄 License
 
