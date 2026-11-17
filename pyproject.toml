@@ -19,6 +19,8 @@ cuopt-bench = "cuopt_scheduler.benchmark:main"
 [project.optional-dependencies]
 # The cuOpt Python library (not the REST server), called directly.
 gpu = ["cuopt-cu13==26.10.*; sys_platform == 'linux'"]
+# GPU PDLP from MIT (source build: needs nvcc and CMake, see README).
+pdlp = ["cupdlpx>=0.3; sys_platform == 'linux'", "scipy>=1.13"]
 
 [dependency-groups]
 dev = [
@@ -33,6 +35,8 @@ requires = ["uv_build>=0.9,<0.14"]
 build-backend = "uv_build"
 
 [tool.uv]
+# uv's own Pythons ship headers, which the `pdlp` extra needs to build cuPDLPx.
+python-preference = "managed"
 
 # Not `explicit`: cuOpt's transitive RAPIDS deps (libcuopt-cu13, cuvs-cu13, ...) are only
 # placeholder sdists on PyPI, so they must resolve from NVIDIA's index too. In practice only
@@ -60,3 +64,8 @@ markers = ["gpu: needs an NVIDIA GPU with cuOpt installed (skipped otherwise)"]
 filterwarnings = [
     "error::DeprecationWarning:cuopt_scheduler",
 ]
+
+# cuPDLPx is source-only on PyPI. Build it for the local GPU with the CUDA toolkit in the
+# standard /usr/local/cuda (it needs CUDA >= 12.4; distro nvcc is often older).
+[tool.uv.extra-build-variables]
+cupdlpx = { CUDACXX = "/usr/local/cuda/bin/nvcc", CMAKE_ARGS = "-DCMAKE_CUDA_ARCHITECTURES=native -DCUDAToolkit_ROOT=/usr/local/cuda" }

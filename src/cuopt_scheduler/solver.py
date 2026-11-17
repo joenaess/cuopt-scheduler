@@ -99,16 +99,12 @@ def _quiet_stdout() -> Iterator[None]:
         os.close(saved)
 
 
-def _solve_highs(model: ScheduleModel, time_limit: float, gap_rel: float | None) -> _Raw:
-    start = time.perf_counter()
-    trace: list[tuple[float, float]] = []
+def highs_model(model: ScheduleModel, time_limit: float, *, relax: bool = False) -> highspy.Highs:
+    """A quiet HiGHS instance holding `model` (as an LP if `relax`)."""
     with _quiet_stdout():
         h = highspy.Highs()
     h.setOptionValue("output_flag", False)
     h.setOptionValue("time_limit", float(time_limit))
-    h.setOptionValue("mip_rel_gap", float(gap_rel or 0.0))
-    h.setOptionValue("mip_abs_gap", _ABS_GAP)
-
     lp = highspy.HighsLp()
     lp.num_col_, lp.num_row_ = model.num_cols, model.num_rows
     lp.col_cost_ = model.cost
@@ -118,11 +114,36 @@ def _solve_highs(model: ScheduleModel, time_limit: float, gap_rel: float | None)
     lp.a_matrix_.start_ = model.offsets
     lp.a_matrix_.index_ = model.indices
     lp.a_matrix_.value_ = model.values
-    lp.integrality_ = [
-        highspy.HighsVarType.kInteger if i else highspy.HighsVarType.kContinuous
-        for i in model.integer
-    ]
+    if not relax:
+        lp.integrality_ = [
+            highspy.HighsVarType.kInteger if i else highspy.HighsVarType.kContinuous
+            for i in model.integer
+        ]
     h.passModel(lp)
+    return h
+
+
+def cuopt_data_model(model: ScheduleModel, *, relax: bool = False) -> object:
+    """A cuOpt DataModel holding `model` (as an LP if `relax`)."""
+    from cuopt.linear_programming import data_model  # pyright: ignore[reportMissingImports]
+
+    dm = data_model.DataModel()
+    dm.set_csr_constraint_matrix(model.values, model.indices, model.offsets)
+    dm.set_constraint_lower_bounds(model.row_lower)
+    dm.set_constraint_upper_bounds(model.row_upper)
+    dm.set_objective_coefficients(model.cost)
+    dm.set_variable_lower_bounds(model.col_lower)
+    dm.set_variable_upper_bounds(model.col_upper)
+    dm.set_variable_types(np.where(model.integer & (not relax), "I", "C"))
+    return dm
+
+
+def _solve_highs(model: ScheduleModel, time_limit: float, gap_rel: float | None) -> _Raw:
+    start = time.perf_counter()
+    trace: list[tuple[float, float]] = []
+    h = highs_model(model, time_limit)
+    h.setOptionValue("mip_rel_gap", float(gap_rel or 0.0))
+    h.setOptionValue("mip_abs_gap", _ABS_GAP)
     h.cbMipImprovingSolution.subscribe(
         lambda e: trace.append((time.perf_counter() - start, e.data_out.objective_function_value))
     )
@@ -142,7 +163,6 @@ def _solve_highs(model: ScheduleModel, time_limit: float, gap_rel: float | None)
 
 def _solve_cuopt(model: ScheduleModel, time_limit: float, gap_rel: float | None) -> _Raw:
     from cuopt.linear_programming import (  # pyright: ignore[reportMissingImports]
-        data_model,
         solver,
         solver_settings,
     )
@@ -167,15 +187,7 @@ def _solve_cuopt(model: ScheduleModel, time_limit: float, gap_rel: float | None)
         ) -> None:
             trace.append((time.perf_counter() - start, float(solution_cost[0])))
 
-    dm = data_model.DataModel()
-    dm.set_csr_constraint_matrix(model.values, model.indices, model.offsets)
-    dm.set_constraint_lower_bounds(model.row_lower)
-    dm.set_constraint_upper_bounds(model.row_upper)
-    dm.set_objective_coefficients(model.cost)
-    dm.set_variable_lower_bounds(model.col_lower)
-    dm.set_variable_upper_bounds(model.col_upper)
-    dm.set_variable_types(np.where(model.integer, "I", "C"))
-
+    dm = cuopt_data_model(model)
     with _quiet_stdout():
         settings = solver_settings.SolverSettings()
         settings.set_parameter("log_to_console", False)
