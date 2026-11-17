@@ -11,7 +11,7 @@ import math
 import os
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -158,9 +158,14 @@ def _solve_cuopt(model: ScheduleModel, time_limit: float, gap_rel: float | None)
     trace: list[tuple[float, float]] = []
 
     class Trace(GetSolutionCallback):  # pyright: ignore[reportUntypedBaseClass]
-        def get_solution(self, solution: object, solution_cost: object) -> None:
-            cost = solution_cost.copy_to_host()[0]  # pyright: ignore[reportAttributeAccessIssue]
-            trace.append((time.perf_counter() - start, float(cost)))
+        def get_solution(
+            self,
+            solution: object,
+            solution_cost: Sequence[float],
+            solution_bound: Sequence[float],
+            user_data: object,
+        ) -> None:
+            trace.append((time.perf_counter() - start, float(solution_cost[0])))
 
     dm = data_model.DataModel()
     dm.set_csr_constraint_matrix(model.values, model.indices, model.offsets)
@@ -177,8 +182,12 @@ def _solve_cuopt(model: ScheduleModel, time_limit: float, gap_rel: float | None)
         settings.set_parameter("time_limit", float(time_limit))
         settings.set_parameter("mip_relative_gap", float(gap_rel or 0.0))
         settings.set_parameter("mip_absolute_gap", _ABS_GAP)
+        # cuOpt 26.10's default presolve (Papilo plus its own) spent 59 of 60 s on a
+        # 40-ward problem without finishing; with it off, cuOpt proves the optimum in 8 s.
+        # This model has little for presolve to remove anyway.
+        settings.set_parameter("presolve", 0)
         callback = Trace()
-        settings.set_mip_callback(callback)
+        settings.set_mip_callback(callback, None)
         solution = solver.Solve(dm, settings)
     if solution.get_error_status() != ErrorStatus.Success:
         raise RuntimeError(solution.get_error_message())
@@ -186,8 +195,8 @@ def _solve_cuopt(model: ScheduleModel, time_limit: float, gap_rel: float | None)
     values = np.asarray(solution.get_primal_solution(), dtype=np.float64)
     objective = solution.get_primal_objective()
     bound = solution.get_milp_stats()["solution_bound"]
-    # cuOpt 25.10 sometimes reports Optimal at the time limit while its own gap is ~100%
-    # (seen with a solution callback attached). Only trust the claim if the bound agrees.
+    # cuOpt 25.10 sometimes reported Optimal at the time limit while its own gap was ~100%
+    # (with a solution callback attached; not seen in 26.10). Only trust it if the bound agrees.
     proven = status == MILPTerminationStatus.Optimal and _gap_closed(objective, bound, gap_rel)
     name = status.name
     if status == MILPTerminationStatus.Optimal and not proven:

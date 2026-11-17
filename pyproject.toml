@@ -18,7 +18,7 @@ cuopt-bench = "cuopt_scheduler.benchmark:main"
 
 [project.optional-dependencies]
 # The cuOpt Python library (not the REST server), called directly.
-gpu = ["cuopt-cu13==25.10.*; sys_platform == 'linux'"]
+gpu = ["cuopt-cu13==26.10.*; sys_platform == 'linux'"]
 
 [dependency-groups]
 dev = [
@@ -33,8 +33,6 @@ requires = ["uv_build>=0.9,<0.14"]
 build-backend = "uv_build"
 
 [tool.uv]
-# cuOpt 25.10 links against libcudss.so.0; cudss 0.8+ ships .so.1 and cuOpt fails to load.
-constraint-dependencies = ["nvidia-cudss-cu13<0.8"]
 
 # Not `explicit`: cuOpt's transitive RAPIDS deps (libcuopt-cu13, cuvs-cu13, ...) are only
 # placeholder sdists on PyPI, so they must resolve from NVIDIA's index too. In practice only
