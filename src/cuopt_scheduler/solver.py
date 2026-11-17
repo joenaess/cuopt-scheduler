@@ -14,6 +14,7 @@ import time
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 
 import highspy
 import numpy as np
@@ -91,7 +92,7 @@ def _quiet_stdout() -> Iterator[None]:
     sys.stdout.flush()
     saved = os.dup(1)
     try:
-        with open(os.devnull, "w") as devnull:
+        with Path(os.devnull).open("w") as devnull:
             os.dup2(devnull.fileno(), 1)
         yield
     finally:

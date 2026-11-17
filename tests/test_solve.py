@@ -82,7 +82,8 @@ def test_hour_cap_resets_each_week() -> None:
     off = {(d, "Day") for d in range(1, 7)}
     p = Problem(employees=(rn("A", 8, unavailable=off),), num_days=8, demand={"Day": {"RN": 1}})
     result = solve(p)
-    assert result.assignments and {a.day for a in result.assignments} == {0, 7}
+    assert result.assignments
+    assert {a.day for a in result.assignments} == {0, 7}
     assert violations(p, result.assignments) == []
 
 
@@ -260,7 +261,8 @@ def test_gpu_failure_falls_back_to_cpu(
     monkeypatch.setattr("cuopt_scheduler.solver.cuopt_available", lambda: True)
     monkeypatch.setitem(solver_module._SOLVERS, Backend.GPU, broken)
     result = solve(small_feasible, Backend.GPU)
-    assert result.backend is Backend.CPU and result.outcome is Outcome.OPTIMAL
+    assert result.backend is Backend.CPU
+    assert result.outcome is Outcome.OPTIMAL
     assert result.warnings == ("cuOpt failed (boom); solved on CPU instead.",)
 
 
@@ -269,7 +271,8 @@ def test_incumbent_trace_ends_at_the_result(backend: Backend) -> None:
     result = solve(generate_problem(45, 14, seed=1), backend)
     assert result.incumbents, "no incumbent was reported"
     times = [t for t, _ in result.incumbents]
-    assert times == sorted(times) and times[-1] <= result.solve_seconds
+    assert times == sorted(times)
+    assert times[-1] <= result.solve_seconds
     assert result.incumbents[-1][1] == pytest.approx(result.objective)
 
 

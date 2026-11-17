@@ -43,7 +43,7 @@ def test_ids_unique_even_when_names_collide() -> None:
 
 @pytest.mark.parametrize(
     ("days", "weeks"),
-    [(1, [range(0, 1)]), (7, [range(0, 7)]), (10, [range(0, 7), range(7, 10)])],
+    [(1, [range(1)]), (7, [range(7)]), (10, [range(7), range(7, 10)])],
 )
 def test_weeks(days: int, weeks: list[range]) -> None:
     assert Problem(employees=(rn("A"),), num_days=days).weeks == weeks
@@ -73,7 +73,8 @@ def test_problem_rejects_shift_without_start_time() -> None:
 def test_levels_add_rules_to_the_same_staff() -> None:
     base, top = generate_problem(30, 14, seed=4), generate_problem(30, 14, seed=4, level=3)
     assert [replace(e, dislikes=frozenset()) for e in top.employees] == list(base.employees)
-    assert base.max_consecutive_days is None and top.max_consecutive_days == 5
+    assert base.max_consecutive_days is None
+    assert top.max_consecutive_days == 5
     assert dict(top.weekly_shift_caps) == {"Night": 2}
     assert all(not e.dislikes for e in base.employees)
     assert all(e.dislikes and not e.dislikes & e.unavailable for e in top.employees)

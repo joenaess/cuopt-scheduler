@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 from collections import Counter, defaultdict
 from collections.abc import Iterable
 
@@ -68,9 +69,11 @@ def violations(problem: Problem, assignments: Iterable[Assignment]) -> list[str]
                 if run == k + 1:
                     problems.append(f"{emp} works more than {k} days in a row (to day {d})")
 
-    for a in assignments:
-        if not problem.employee(a.employee_id).is_available(a.day, a.shift):
-            problems.append(f"{a.employee_id} is unavailable for {a.shift} on day {a.day}")
+    problems.extend(
+        f"{a.employee_id} is unavailable for {a.shift} on day {a.day}"
+        for a in assignments
+        if not problem.employee(a.employee_id).is_available(a.day, a.shift)
+    )
 
     # Rest: compare actual clock times, independently of how the model encodes it.
     starts: dict[str, list[tuple[int, Assignment]]] = defaultdict(list)
@@ -78,7 +81,7 @@ def violations(problem: Problem, assignments: Iterable[Assignment]) -> list[str]
         starts[a.employee_id].append((problem.start_hour(a.day, a.shift), a))
     for emp, worked in starts.items():
         worked.sort()
-        for (start1, a1), (start2, a2) in zip(worked, worked[1:], strict=False):
+        for (start1, a1), (start2, a2) in itertools.pairwise(worked):
             rest = start2 - (start1 + problem.shift_length)
             if a1.day != a2.day and rest < problem.min_rest_hours:
                 problems.append(

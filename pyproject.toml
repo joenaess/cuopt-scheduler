@@ -15,6 +15,7 @@ dependencies = [
 
 [project.scripts]
 cuopt-bench = "cuopt_scheduler.benchmark:main"
+cuopt-plots = "cuopt_scheduler.plots:main"  # needs matplotlib (dev group)
 
 [project.optional-dependencies]
 # The cuOpt Python library (not the REST server), called directly.
@@ -25,6 +26,8 @@ pdlp = ["cupdlpx>=0.3; sys_platform == 'linux'", "scipy>=1.13"]
 [dependency-groups]
 dev = [
     "hypothesis>=6.100",
+    "matplotlib>=3.9",
+    "pre-commit>=4",
     "pyright>=1.1.390",
     "pytest>=8",
     "ruff>=0.8",
@@ -50,7 +53,23 @@ line-length = 100
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "B", "UP", "SIM"]
+select = [
+    "E", "W",  # pycodestyle
+    "F",       # pyflakes
+    "I",       # isort
+    "B",       # bugbear
+    "UP",      # pyupgrade
+    "SIM",     # simplify
+    "C4",      # comprehensions
+    "PIE",     # misc. lints
+    "RET",     # return statements
+    "PERF",    # performance anti-patterns
+    "PT",      # pytest style
+    "NPY",     # numpy
+    "PTH",     # pathlib over os.path
+    "RUF",     # ruff-specific
+]
+allowed-confusables = ["×"]  # multiplication sign in chart labels
 
 [tool.pyright]
 include = ["src", "tests", "app.py"]

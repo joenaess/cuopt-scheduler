@@ -46,7 +46,8 @@ def test_benchmark_cpu_methods() -> None:
     assert len(batches) == 4  # one per problem: 2 sizes x 2 levels
     rows = [r for batch in batches for r in batch]
     assert {(r.wards, r.level) for r in rows} == {(1, 0), (1, 3), (2, 0), (2, 3)}
-    assert {r.method for r in rows} == set(CPU_METHODS) and {r.device for r in rows} == {"cpu"}
+    assert {r.method for r in rows} == set(CPU_METHODS)
+    assert {r.device for r in rows} == {"cpu"}
     mip = [r for r in rows if r.method == Method.HIGHS_MIP]
     assert all(r.outcome == "optimal" and r.uncovered == 0 for r in mip)
     assert all(r.outcome == "feasible" for r in rows if r.method != Method.HIGHS_MIP)
@@ -63,7 +64,8 @@ def test_cli_prints_table_and_writes_csv(
     out = tmp_path / "bench.csv"
     main(["--wards", "1", "--days", "7", "--time-limit", "10", "--csv", str(out)])
     printed = capsys.readouterr().out
-    assert "running CPU only" in printed and "optimal" in printed
+    assert "running CPU only" in printed
+    assert "optimal" in printed
     lines = out.read_text().splitlines()
     assert lines[0].startswith("wards,employees,level,days,seed,method,device,outcome")
     assert lines[0].endswith("first_seconds,near_seconds")

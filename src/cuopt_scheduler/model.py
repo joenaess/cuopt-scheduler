@@ -109,10 +109,10 @@ def build_model(problem: Problem) -> ScheduleModel:
     max_shifts = np.array(
         [e.max_weekly_hours // problem.shift_length for e in employees], np.float64
     )
-    for week in problem.weeks:
-        blocks.append(
-            _Block(x[:, :, week.start : week.stop].reshape(n_emp, -1), -np.inf, max_shifts)
-        )
+    blocks.extend(
+        _Block(x[:, :, week.start : week.stop].reshape(n_emp, -1), -np.inf, max_shifts)
+        for week in problem.weeks
+    )
 
     # 3. At most one shift per day.
     blocks.append(_Block(x.transpose(0, 2, 1).reshape(-1, n_shift), -np.inf, 1.0))
@@ -126,8 +126,9 @@ def build_model(problem: Problem) -> ScheduleModel:
     # 5. Per-shift weekly caps (e.g. nights).
     for s, cap in problem.weekly_shift_caps.items():
         si = shifts.index(s)
-        for week in problem.weeks:
-            blocks.append(_Block(x[:, si, week.start : week.stop], -np.inf, float(cap)))
+        blocks.extend(
+            _Block(x[:, si, week.start : week.stop], -np.inf, float(cap)) for week in problem.weeks
+        )
 
     # 6. Minimum rest between consecutive days' shifts.
     for today, tomorrow in rest_conflicts(problem):
