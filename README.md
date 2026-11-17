@@ -69,6 +69,21 @@ Both solvers get the identical model arrays, and each result is checked by the i
 
 **For this model, the CPU wins at every size tested.** cuOpt is called directly, with the same gap settings as HiGHS, so this is cuOpt itself, not a wrapper. At these sizes the problem is mostly about proving optimality, and cuOpt 25.10 runs that search on CPU threads. Even when given the optimal schedule as its starting point (through its solution callback; `DataModel.set_initial_primal_solution` fails for MIPs in 25.10), it needed 9 s to prove it at 10 wards, where HiGHS takes 1–2 s in total. Re-run the benchmark after upgrading cuOpt.
 
+### Time to a good schedule
+
+Proving optimality is CPU-bound branch-and-bound, but a user mostly waits for a good roster. So the benchmark also reports when each solver first had any schedule (`first_seconds`) and when it first had one within 1% of the best either solver found (`near_seconds`), from the solvers' improving-solution callbacks. Larger problems, 120 s limit, seeds 0 and 1:
+
+| Wards | Employees | HiGHS first / within 1% | cuOpt first / within 1% |
+|---|---|---|---|
+| 10 | 340 | 0.6–0.7 s / 0.9–1.7 s | 5.0–5.7 s / 5.0–6.2 s |
+| 40 | 1,360 | 3.9–4.7 s / 4.7–7.8 s | 41 s / never (62–1,071 slots uncovered at 120 s) |
+| 160 | 5,440 | 8.1–8.3 s / 22–24 s | 48 s / 81–96 s |
+| 320 | 10,880 | 20 s / 80–90 s (proven optimal 83–91 s) | 48 s / never (2 slots uncovered at 120 s) |
+
+**The CPU is also faster to a good schedule, at every size up to 10,880 staff.** cuOpt's first schedule arrives later when the time limit is longer: at 40 wards it came at the very end of a 15 s or 30 s limit (and was poor), at 38 s with 60 s, and at 41 s with 120 s. So a short limit doesn't buy a fast first answer either. cuOpt's LP bound is tight immediately (16,800 at 40 wards, the true optimum), so the slow part is finding schedules, which is the work cuOpt does on the GPU.
+
+cuOpt 25.10 also sometimes reports "Optimal" at the time limit while its own gap is near 100% (seen with a solution callback attached). Both backends therefore count a result as optimal only if the solver's own bound backs it up.
+
 ## 🧪 Development
 
 ```bash
