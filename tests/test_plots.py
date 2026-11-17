@@ -3,7 +3,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from cuopt_scheduler.plots import gpu_speedup, plot_all
+from cuopt_scheduler.plots import gpu_speedup, markdown_table, plot_all
 
 pytest.importorskip("matplotlib")
 
@@ -27,6 +27,7 @@ def rows() -> pd.DataFrame:
                         "seed": 0,
                         "method": method,
                         "device": device,
+                        "outcome": "feasible",
                         "seconds": 120.0 if near is None else near,
                         "near_seconds": near,
                     }
@@ -51,3 +52,15 @@ def test_plot_all_writes_light_and_dark_charts(tmp_path: Path) -> None:
         for theme in ("light", "dark")
     )
     assert all(p.stat().st_size > 10_000 for p in written)
+
+
+def test_markdown_table_marks_the_fastest_misses_and_failures() -> None:
+    df = rows()
+    failed = (df["wards"] == 20) & (df["level"] == 3) & (df["method"] == "cuopt-mip")
+    df.loc[failed, "outcome"] = "failed: cuOpt failed (Memory allocation failed)"
+    lines = markdown_table(df).splitlines()
+    assert lines[0].startswith("| Employees | Level | HiGHS MILP (CPU) | cuOpt MILP (GPU) |")
+    assert len(lines) == 2 + 4  # header, rule, one row per problem
+    # 170 employees, level 0: HiGHS MILP 10 s, cuOpt MILP missed, rounding 1 s and 0.5 s.
+    assert lines[2] == "| 170 | 0 | 10 | – |  |  | 1 | **0.5** |"
+    assert "failed (GPU memory)" in lines[5]

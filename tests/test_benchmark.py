@@ -1,7 +1,9 @@
+import dataclasses
+
 import pytest
 
-from cuopt_scheduler import Backend, Outcome, SolveResult
-from cuopt_scheduler.benchmark import Method, iter_benchmark, main, seconds_to_reach
+from cuopt_scheduler import Backend, Outcome, SolveResult, generate_problem
+from cuopt_scheduler.benchmark import Method, _row, iter_benchmark, main, seconds_to_reach
 
 
 def result(objective: float | None, incumbents: tuple[tuple[float, float], ...]) -> SolveResult:
@@ -52,8 +54,12 @@ def test_benchmark_cpu_methods() -> None:
     assert all(r.outcome == "optimal" and r.uncovered == 0 for r in mip)
     assert all(r.outcome == "feasible" for r in rows if r.method != Method.HIGHS_MIP)
     # Alone, each run is its own best: it reaches "near" no later than it finishes.
-    assert all(r.first_seconds is not None and r.first_seconds <= r.seconds for r in rows)
-    assert all(r.near_seconds is not None and r.near_seconds <= r.seconds for r in rows)
+    for r in rows:
+        assert r.seconds is not None
+        assert r.first_seconds is not None
+        assert r.near_seconds is not None
+        assert r.first_seconds <= r.seconds
+        assert r.near_seconds <= r.seconds
 
 
 def test_cli_prints_table_and_writes_csv(
@@ -75,3 +81,12 @@ def test_cli_rejects_unavailable_methods(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr("cuopt_scheduler.benchmark.cuopt_available", lambda: False)
     with pytest.raises(SystemExit, match="not available here: cuopt-mip"):
         main(["--methods", "highs-mip", "cuopt-mip"])
+
+
+def test_a_gpu_method_that_fell_back_to_the_cpu_is_recorded_as_failed() -> None:
+    fallback = dataclasses.replace(
+        result(100, ((1.0, 100),)), warnings=("cuOpt failed (Memory allocation failed)",)
+    )
+    row = _row(generate_problem(10, 7, seed=0), 1, 0, 7, 0, Method.CUOPT_MIP, fallback, 101)
+    assert row.outcome == "failed: cuOpt failed (Memory allocation failed)"
+    assert (row.device, row.seconds, row.objective, row.near_seconds) == ("gpu", None, None, None)

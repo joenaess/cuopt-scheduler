@@ -13,10 +13,12 @@ directly, so nothing depends on colour alone.
 from __future__ import annotations
 
 import argparse
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 # The methods the charts follow, in fixed colour order. Tables in the README cover all.
@@ -81,6 +83,41 @@ def gpu_speedup(df: pd.DataFrame) -> pd.DataFrame:
     return best.assign(speedup=best["cpu"] / best["gpu"]).reset_index()
 
 
+TABLE_METHODS: dict[str, str] = {
+    "highs-mip": "HiGHS MILP (CPU)",
+    "cuopt-mip": "cuOpt MILP (GPU)",
+    "cuopt-pdlp+round+mip": "cuOpt MILP from rounding (GPU)",
+    "highs-simplex+round": "HiGHS simplex + rounding (CPU)",
+    "highs-pdlp+round": "HiGHS PDLP + rounding (CPU)",
+    "cuopt-pdlp+round": "cuOpt PDLP + rounding (GPU)",
+}
+
+
+def markdown_table(df: pd.DataFrame) -> str:
+    """Seconds to within 1% of the best, one row per problem; fastest in bold."""
+
+    def cell(rows: pd.DataFrame, best: float) -> str:
+        if rows.empty:
+            return ""
+        r = rows.iloc[0]
+        if str(r["outcome"]).startswith("failed"):
+            return "failed" + (" (GPU memory)" if "Memory" in str(r["outcome"]) else "")
+        t = r["near_seconds"]
+        if pd.isna(t):
+            return "–"
+        text = f"{t:.2g}" if t < 10 else f"{t:.0f}"
+        return f"**{text}**" if t <= best * 1.05 else text
+
+    head = ["Employees", "Level", *TABLE_METHODS.values()]
+    lines = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+    for key, rows in df.groupby(["employees", "level"]):
+        employees, level = key  # pyright: ignore[reportGeneralTypeIssues]
+        best = float(rows["near_seconds"].dropna().to_numpy(dtype=float).min(initial=np.inf))
+        cells = [cell(rows.loc[rows["method"] == m], best) for m in TABLE_METHODS]
+        lines.append(f"| {employees:,} | {level} | " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
 def _style(ax, theme: Theme) -> None:
     ax.set_facecolor(theme.surface)
     for side in ("top", "right"):
@@ -95,14 +132,20 @@ def _style(ax, theme: Theme) -> None:
     ax.title.set_color(theme.ink)
 
 
-def _log_axis(axis, unit: str = "", prefix: str = "") -> None:
+def _plain(v: float) -> str:
+    """1,000 / 20 / 0.5 / 0.05: just enough decimals to show the leading digit."""
+    decimals = 0 if v >= 1 else -math.floor(math.log10(v) + 1e-9)
+    return f"{v:,.{decimals}f}"
+
+
+def _log_axis(
+    axis, unit: str = "", prefix: str = "", subs: tuple[float, ...] = (1.0, 2.0, 5.0)
+) -> None:
     """Log scale with plain labels at 1-2-5 steps (no 2x10^2 notation)."""
     from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter
 
-    axis.set_major_locator(LogLocator(base=10, subs=(1.0, 2.0, 5.0)))
-    axis.set_major_formatter(
-        FuncFormatter(lambda v, _: f"{prefix}{v:,.{0 if v >= 1 else 1}f}{unit}")
-    )
+    axis.set_major_locator(LogLocator(base=10, subs=subs))
+    axis.set_major_formatter(FuncFormatter(lambda v, _: f"{prefix}{_plain(v)}{unit}"))
     axis.set_minor_formatter(NullFormatter())
 
 
@@ -153,8 +196,15 @@ def _method_lines(ax, data: pd.DataFrame, x: str, theme: Theme, limit: float) ->
             continue
         med = pd.Series(rows.groupby(x)["near_seconds"].median()).sort_index()
         style = "-" if method.startswith("cuopt") else "--"
+        width = 2.0
+        if method == "cuopt-pdlp+round+mip":
+            # Starts from the rounded schedule, so it coincides with cuopt-pdlp+round: draw
+            # it dotted on top so both stay visible.
+            style, width = ":", 2.4
         hit = med.dropna()
-        ax.plot(hit.index, hit.values, style, color=colour, linewidth=2, marker="o", markersize=5)
+        ax.plot(
+            hit.index, hit.values, style, color=colour, linewidth=width, marker="o", markersize=4
+        )
         missed = [i for i, v in med.items() if pd.isna(v)]
         ax.plot(
             missed,
@@ -194,7 +244,7 @@ def plot_time_to_good(df: pd.DataFrame, out: Path, theme: Theme, limit: float) -
         _log_axis(ax.xaxis)
         _method_lines(ax, df.loc[df["level"] == level], "employees", theme, limit)
         ax.set_xlabel("Employees (34 per ward, 28 days)")
-        ax.set_title(f"Difficulty level {level}", fontsize=10, loc="left")
+        ax.set_title(f"Difficulty level {level}", fontsize=10, loc="left", color=theme.ink)
     axes[0].set_ylabel("Seconds to a schedule within 1% of the best")
     fig.suptitle("Time to a good schedule as the problem grows", color=theme.ink, x=0.06, ha="left")
     return _save(fig, out / f"time-to-good-{theme.name}.png", theme)
@@ -222,7 +272,7 @@ def plot_speedup(df: pd.DataFrame, out: Path, theme: Theme) -> Path:
     ax.set_xscale("log")
     ax.set_yscale("log")
     _log_axis(ax.xaxis)
-    _log_axis(ax.yaxis, prefix="×")
+    _log_axis(ax.yaxis, prefix="×", subs=(1.0, 2.0, 3.0, 5.0))
     ends = []
     for colour, level in zip(theme.series, sorted(s["level"].unique()), strict=False):
         rows = pd.Series(
@@ -277,7 +327,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--out", type=Path, default=Path("docs/img"))
     parser.add_argument("--time-limit", type=float, default=120)
     parser.add_argument("--level-wards", type=int, default=80)
+    parser.add_argument("--table", action="store_true", help="print a Markdown table instead")
     args = parser.parse_args(argv)
+    if args.table:
+        print(markdown_table(load(args.csv)))
+        return
     for path in plot_all(args.csv, args.out, args.time_limit, args.level_wards):
         print(path)
 

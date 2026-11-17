@@ -9,7 +9,7 @@ shortfall.
 
 LP engines: HiGHS on the CPU (dual simplex or PDLP) and cuOpt's PDLP on the GPU.
 
-`solve_warm_started` goes one step further on the GPU: it hands the rounded schedule to
+`warm_started_mip` goes one step further on the GPU: it hands the rounded schedule to
 cuOpt's MILP solver as a starting point, which then only has to prove it (or improve it).
 """
 
@@ -138,30 +138,26 @@ def solve_lp_round(
     return _checked(make_result(model, raw, engine.backend, elapsed, build_seconds))
 
 
-def solve_warm_started(
-    problem: Problem, time_limit: float = 30, gap_rel: float | None = None
-) -> SolveResult:
+def warm_started_mip(model: ScheduleModel, time_limit: float, gap_rel: float | None) -> RawSolution:
     """cuOpt PDLP + rounding, then cuOpt's MILP solver starting from that schedule.
 
     Has a good schedule as soon as the LP is solved, and can still prove it optimal. The
-    time limit covers both steps.
+    time limit covers both steps. Used by `solve(..., Backend.GPU)`.
     """
-    start = time.perf_counter()
-    model = build_model(problem)
-    build_seconds = time.perf_counter() - start
-
     start = time.perf_counter()
     rounded = round_lp(model, solve_lp(model, LPEngine.CUOPT_PDLP, time_limit))
     t_lp = time.perf_counter() - start
-    remaining = max(1.0, time_limit - t_lp)
-    raw = _solve_cuopt(model, remaining, gap_rel, initial=rounded)
-    elapsed = time.perf_counter() - start
-    trace = ((t_lp, float(model.cost @ rounded)), *((t_lp + t, o) for t, o in raw.incumbents))
-    if raw.values is None:  # cuOpt returned nothing better: keep the rounded schedule
-        raw = RawSolution(rounded, False, raw.status, trace)
-    else:
-        raw = RawSolution(raw.values, raw.proven, raw.status, trace)
-    return _checked(make_result(model, raw, Backend.GPU, elapsed, build_seconds))
+    first = ((t_lp, float(model.cost @ rounded)),)
+    try:
+        raw = _solve_cuopt(model, max(1.0, time_limit - t_lp), gap_rel, initial=rounded)
+    except Exception as exc:
+        # E.g. out of GPU memory: the MILP solver needs far more than PDLP. The rounded
+        # schedule is still valid, so keep it rather than start over on the CPU.
+        return RawSolution(rounded, False, f"cuOpt MILP failed ({exc}); rounded LP", first)
+    trace = (*first, *((t_lp + t, o) for t, o in raw.incumbents))
+    if raw.values is None:  # cuOpt returned nothing: keep the rounded schedule
+        return RawSolution(rounded, False, raw.status, trace)
+    return RawSolution(raw.values, raw.proven, raw.status, trace)
 
 
 def _checked(result: SolveResult) -> SolveResult:

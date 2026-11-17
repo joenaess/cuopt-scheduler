@@ -1,0 +1,7 @@
+wards,employees,level,days,seed,method,device,outcome,seconds,build_seconds,objective,uncovered,first_seconds,near_seconds
+320,10880,3,28,0,highs-mip,cpu,feasible,125.32,0.205,29951304.0,29846.0,33.963,
+320,10880,3,28,0,cuopt-mip,gpu,failed: cuOpt failed (Memory allocation failed); solved on CPU instead.,,0.186,,,,
+320,10880,3,28,0,cuopt-pdlp+round+mip,gpu,optimal,122.538,0.207,134400.0,0.0,2.484,2.484
+320,10880,3,28,0,highs-simplex+round,cpu,feasible,121.819,0.185,313752.0,167.0,121.819,
+320,10880,3,28,0,highs-pdlp+round,cpu,feasible,6.593,0.186,134408.0,0.0,6.593,6.593
+320,10880,3,28,0,cuopt-pdlp+round,gpu,feasible,2.172,0.183,134400.0,0.0,2.172,2.172

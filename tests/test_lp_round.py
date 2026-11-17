@@ -6,7 +6,7 @@ from hypothesis.extra.numpy import arrays
 
 from cuopt_scheduler import Backend, Outcome, Problem, generate_problem, schedule_cost, solve
 from cuopt_scheduler.data import LEVELS
-from cuopt_scheduler.lp_round import LPEngine, round_lp, solve_lp_round, solve_warm_started
+from cuopt_scheduler.lp_round import LPEngine, round_lp, solve_lp_round
 from cuopt_scheduler.model import build_model
 from cuopt_scheduler.solver import classify
 
@@ -65,7 +65,7 @@ def test_gpu_lp_round() -> None:
 @pytest.mark.gpu
 def test_warm_started_mip_proves_the_rounded_schedule() -> None:
     problem = generate_problem(68, 14, seed=2, wards=2, level=3)
-    result = solve_warm_started(problem, time_limit=60)
+    result = solve(problem, Backend.GPU, time_limit=60)
     assert result.backend is Backend.GPU
     assert result.outcome is Outcome.OPTIMAL
     assert result.objective == solve(problem).objective
@@ -75,3 +75,20 @@ def test_warm_started_mip_proves_the_rounded_schedule() -> None:
     first_t, first_obj = result.incumbents[0]
     assert first_t <= result.solve_seconds
     assert first_obj >= result.objective
+
+
+@pytest.mark.gpu
+def test_warm_start_keeps_the_rounded_schedule_if_the_milp_solver_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def out_of_memory(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("Memory allocation failed")
+
+    monkeypatch.setattr("cuopt_scheduler.lp_round._solve_cuopt", out_of_memory)
+    problem = generate_problem(45, 14, seed=1, level=3)
+    result = solve(problem, Backend.GPU)
+    assert result.backend is Backend.GPU
+    assert result.warnings == ()
+    assert result.outcome is Outcome.FEASIBLE
+    assert "Memory allocation failed" in result.solver_status
+    assert result.objective == schedule_cost(problem, result.assignments)

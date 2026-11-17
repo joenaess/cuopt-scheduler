@@ -63,7 +63,7 @@ select = [
     "PTH",     # pathlib over os.path
     "RUF",     # ruff-specific
 ]
-allowed-confusables = ["×"]  # multiplication sign in chart labels
+allowed-confusables = ["×", "–"]  # multiplication sign, en dash (empty table cell)
 
 [tool.pyright]
 include = ["src", "tests", "app.py"]
@@ -77,4 +77,3 @@ markers = ["gpu: needs an NVIDIA GPU with cuOpt installed (skipped otherwise)"]
 filterwarnings = [
     "error::DeprecationWarning:cuopt_scheduler",
 ]
-

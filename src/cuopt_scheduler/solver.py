@@ -276,7 +276,12 @@ def classify(model: ScheduleModel, values: FloatArray | None, proven: bool) -> O
     return Outcome.OPTIMAL if proven else Outcome.FEASIBLE
 
 
-_SOLVERS = {Backend.CPU: _solve_highs, Backend.GPU: _solve_cuopt}
+def _solve_cuopt_warm(
+    model: ScheduleModel, time_limit: float, gap_rel: float | None
+) -> RawSolution:
+    from cuopt_scheduler.lp_round import warm_started_mip  # lp_round imports this module
+
+    return warm_started_mip(model, time_limit, gap_rel)
 
 
 def solve(
@@ -284,10 +289,16 @@ def solve(
     backend: Backend = Backend.CPU,
     time_limit: float = 30,
     gap_rel: float | None = None,
+    *,
+    warm_start: bool = True,
 ) -> SolveResult:
     """Solve `problem`. `gap_rel` lets the solver stop once it is provably within that
     fraction of the best possible objective (None = prove optimal); the result then
-    counts as optimal."""
+    counts as optimal.
+
+    On the GPU, `warm_start` first builds a schedule from cuOpt's PDLP LP solution and
+    hands it to cuOpt's MILP solver as a starting point (much faster to a good schedule;
+    see the README). Off, cuOpt's MILP solver starts from scratch."""
     start = time.perf_counter()
     model = build_model(problem)
     build_seconds = time.perf_counter() - start
@@ -297,16 +308,20 @@ def solve(
         warnings.append("cuOpt is not available; solved on CPU instead.")
         backend = Backend.CPU
 
+    gpu_solver = _solve_cuopt_warm if warm_start else _solve_cuopt
     start = time.perf_counter()
     try:
-        raw = _SOLVERS[backend](model, time_limit, gap_rel)
+        if backend is Backend.CPU:
+            raw = _solve_highs(model, time_limit, gap_rel)
+        else:
+            raw = gpu_solver(model, time_limit, gap_rel)
     except Exception as exc:
         if backend is Backend.CPU:
             raise
         warnings.append(f"cuOpt failed ({exc}); solved on CPU instead.")
         backend = Backend.CPU
         start = time.perf_counter()
-        raw = _SOLVERS[backend](model, time_limit, gap_rel)
+        raw = _solve_highs(model, time_limit, gap_rel)
     elapsed = time.perf_counter() - start
 
     return make_result(model, raw, backend, elapsed, build_seconds, tuple(warnings))

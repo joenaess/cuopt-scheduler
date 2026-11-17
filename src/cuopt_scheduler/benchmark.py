@@ -29,7 +29,7 @@ from pathlib import Path
 import pandas as pd
 
 from cuopt_scheduler.data import LEVELS, Problem, generate_problem
-from cuopt_scheduler.lp_round import LPEngine, solve_lp_round, solve_warm_started
+from cuopt_scheduler.lp_round import LPEngine, solve_lp_round
 from cuopt_scheduler.solver import Backend, SolveResult, cuopt_available, solve
 from cuopt_scheduler.validate import coverage_gaps, violations
 
@@ -63,14 +63,17 @@ class Method(StrEnum):
         return self.device is Backend.CPU or cuopt_available()
 
     def run(self, problem: Problem, time_limit: float, gap_rel: float | None) -> SolveResult:
+        """Solve with this method. A GPU method that had to fall back to the CPU returns
+        that CPU result; `iter_benchmark` records it as failed."""
         if engine := self.lp_engine:
             return solve_lp_round(problem, engine, time_limit)
-        if self is Method.CUOPT_MIP_WARM:
-            return solve_warm_started(problem, time_limit, gap_rel)
-        result = solve(problem, self.device, time_limit=time_limit, gap_rel=gap_rel)
-        if result.backend is not self.device:
-            raise RuntimeError(f"{self} fell back to {result.backend}: {result.warnings}")
-        return result
+        return solve(
+            problem,
+            self.device,
+            time_limit=time_limit,
+            gap_rel=gap_rel,
+            warm_start=self is Method.CUOPT_MIP_WARM,
+        )
 
 
 @dataclass(frozen=True)
@@ -83,7 +86,8 @@ class BenchmarkRow:
     method: str
     device: str
     outcome: str
-    seconds: float
+    """optimal / feasible / no_solution, or "failed: ..." if a GPU method had to fall back."""
+    seconds: float | None
     """Time in the solver. Building the model is timed separately."""
     build_seconds: float
     objective: float | None
@@ -125,7 +129,9 @@ def iter_benchmark(
     for method in methods:
         if method.device is Backend.GPU:
             # The first call pays for CUDA initialisation; keep that out of the timings.
-            method.run(generate_problem(10, 7, seed=0), time_limit=10, gap_rel=None)
+            warm_up = method.run(generate_problem(10, 7, seed=0), time_limit=10, gap_rel=None)
+            if warm_up.backend is not Backend.GPU:
+                raise RuntimeError(f"{method} can't run on the GPU: {warm_up.warnings}")
 
     for w, level, d, seed in itertools.product(wards, levels, days, seeds):
         problem = generate_problem(w * staff_per_ward, d, seed=seed, wards=w, level=level)
@@ -135,29 +141,57 @@ def iter_benchmark(
             if broken := violations(problem, result.assignments):
                 raise AssertionError(f"{method} returned an invalid schedule: {broken[:3]}")
             results.append((method, result))
-        found = [r.objective for _, r in results if r.objective is not None]
+        found = [
+            r.objective for m, r in results if r.objective is not None and r.backend is m.device
+        ]
         target = min(found) * (1 + near) if found else -float("inf")
         yield [
-            BenchmarkRow(
-                wards=w,
-                employees=len(problem.employees),
-                level=level,
-                days=d,
-                seed=seed,
-                method=str(method),
-                device=str(method.device),
-                outcome=str(result.outcome),
-                seconds=round(result.solve_seconds, 3),
-                build_seconds=round(result.build_seconds, 3),
-                objective=result.objective,
-                uncovered=sum(coverage_gaps(problem, result.assignments).values())
-                if result.feasible
-                else None,
-                first_seconds=_round(seconds_to_reach(result, float("inf"))),
-                near_seconds=_round(seconds_to_reach(result, target)),
-            )
-            for method, result in results
+            _row(problem, w, level, d, seed, method, result, target) for method, result in results
         ]
+
+
+def _row(
+    problem: Problem,
+    wards: int,
+    level: int,
+    days: int,
+    seed: int,
+    method: Method,
+    result: SolveResult,
+    target: float,
+) -> BenchmarkRow:
+    common = {
+        "wards": wards,
+        "employees": len(problem.employees),
+        "level": level,
+        "days": days,
+        "seed": seed,
+        "method": str(method),
+        "device": str(method.device),
+        "build_seconds": round(result.build_seconds, 3),
+    }
+    if result.backend is not method.device:
+        # The GPU solver failed (e.g. out of GPU memory); the CPU fallback's result isn't its own.
+        return BenchmarkRow(
+            **common,
+            outcome="failed: " + "; ".join(result.warnings),
+            seconds=None,
+            objective=None,
+            uncovered=None,
+            first_seconds=None,
+            near_seconds=None,
+        )
+    return BenchmarkRow(
+        **common,
+        outcome=str(result.outcome),
+        seconds=round(result.solve_seconds, 3),
+        objective=result.objective,
+        uncovered=sum(coverage_gaps(problem, result.assignments).values())
+        if result.feasible
+        else None,
+        first_seconds=_round(seconds_to_reach(result, float("inf"))),
+        near_seconds=_round(seconds_to_reach(result, target)),
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> None:

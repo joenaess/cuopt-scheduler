@@ -234,10 +234,12 @@ def test_model_agrees_with_validator(
 
 
 @pytest.mark.gpu
+@pytest.mark.parametrize("warm_start", [True, False])
 @pytest.mark.parametrize("seed", [1, 2, 3])
-def test_gpu_matches_cpu(seed: int) -> None:
+def test_gpu_matches_cpu(seed: int, warm_start: bool) -> None:
     problem = generate_problem(45, 14, seed=seed)
-    cpu, gpu = solve(problem, Backend.CPU), solve(problem, Backend.GPU)
+    cpu = solve(problem, Backend.CPU)
+    gpu = solve(problem, Backend.GPU, warm_start=warm_start)
     assert gpu.backend is Backend.GPU, gpu.warnings
     assert cpu.outcome is gpu.outcome is Outcome.OPTIMAL
     assert gpu.objective == pytest.approx(cpu.objective)
@@ -252,15 +254,17 @@ def test_gpu_reports_its_own_backend(understaffed: Problem) -> None:
     assert coverage_gaps(understaffed, result.assignments) == {(1, "Night", "RN"): 1}
 
 
+@pytest.mark.parametrize("warm_start", [True, False])
 def test_gpu_failure_falls_back_to_cpu(
-    small_feasible: Problem, monkeypatch: pytest.MonkeyPatch
+    small_feasible: Problem, monkeypatch: pytest.MonkeyPatch, warm_start: bool
 ) -> None:
-    def broken(*args: object) -> None:
+    def broken(*args: object, **kwargs: object) -> None:
         raise RuntimeError("boom")
 
     monkeypatch.setattr("cuopt_scheduler.solver.cuopt_available", lambda: True)
-    monkeypatch.setitem(solver_module._SOLVERS, Backend.GPU, broken)
-    result = solve(small_feasible, Backend.GPU)
+    monkeypatch.setattr(solver_module, "_solve_cuopt", broken)
+    monkeypatch.setattr(solver_module, "_solve_cuopt_warm", broken)
+    result = solve(small_feasible, Backend.GPU, warm_start=warm_start)
     assert result.backend is Backend.CPU
     assert result.outcome is Outcome.OPTIMAL
     assert result.warnings == ("cuOpt failed (boom); solved on CPU instead.",)
