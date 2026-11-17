@@ -68,6 +68,12 @@ class _Raw:
     status: str
 
 
+def _gap_closed(objective: float, bound: float, gap_rel: float | None) -> bool:
+    """True if the solver's own bound backs up an optimality claim (minimisation)."""
+    allowed = max(_ABS_GAP, (gap_rel or 0.0) * abs(objective))
+    return objective - bound <= allowed + 1e-6
+
+
 @contextlib.contextmanager
 def _quiet_stdout() -> Iterator[None]:
     """Silence C-level stdout: HiGHS prints a banner and cuOpt echoes every setting, even
@@ -108,12 +114,12 @@ def _solve_highs(model: ScheduleModel, time_limit: float, gap_rel: float | None)
     h.run()
 
     status = h.getModelStatus()
-    has_solution = (
-        h.getInfo().primal_solution_status == highspy.SolutionStatus.kSolutionStatusFeasible
-    )
+    info = h.getInfo()
+    has_solution = info.primal_solution_status == highspy.SolutionStatus.kSolutionStatusFeasible
+    claimed = status == highspy.HighsModelStatus.kOptimal
     return _Raw(
         values=np.asarray(h.getSolution().col_value) if has_solution else None,
-        proven=status == highspy.HighsModelStatus.kOptimal,
+        proven=claimed and _gap_closed(info.objective_function_value, info.mip_dual_bound, gap_rel),
         status=h.modelStatusToString(status),
     )
 
@@ -147,13 +153,17 @@ def _solve_cuopt(model: ScheduleModel, time_limit: float, gap_rel: float | None)
         solution = solver.Solve(dm, settings)
     if solution.get_error_status() != ErrorStatus.Success:
         raise RuntimeError(solution.get_error_message())
-    status = solution.get_termination_status()
+    status = MILPTerminationStatus(solution.get_termination_status())
     values = np.asarray(solution.get_primal_solution(), dtype=np.float64)
-    return _Raw(
-        values=values if len(values) else None,
-        proven=status == MILPTerminationStatus.Optimal,
-        status=MILPTerminationStatus(status).name,
-    )
+    objective = solution.get_primal_objective()
+    bound = solution.get_milp_stats()["solution_bound"]
+    # cuOpt 25.10 sometimes reports Optimal at the time limit while its own gap is ~100%
+    # (seen with a solution callback attached). Only trust the claim if the bound agrees.
+    proven = status == MILPTerminationStatus.Optimal and _gap_closed(objective, bound, gap_rel)
+    name = status.name
+    if status == MILPTerminationStatus.Optimal and not proven:
+        name += f" (unproven: objective {objective:g}, bound {bound:g})"
+    return _Raw(values=values if len(values) else None, proven=proven, status=name)
 
 
 @functools.cache

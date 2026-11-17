@@ -18,7 +18,7 @@ from cuopt_scheduler import (
 )
 from cuopt_scheduler import solver as solver_module
 from cuopt_scheduler.model import UNCOVERED_PENALTY, ScheduleModel, build_model, rest_conflicts
-from cuopt_scheduler.solver import classify
+from cuopt_scheduler.solver import _gap_closed, classify
 
 from .conftest import SMALL_DEMAND, rn
 
@@ -147,6 +147,21 @@ def test_classify_rejects_invalid(tiny: ScheduleModel, values: list[float] | Non
     arr = None if values is None else np.array(values)
     # Even if the solver claims to have proven it.
     assert classify(tiny, arr, proven=True) is Outcome.NO_SOLUTION
+
+
+@pytest.mark.parametrize(
+    ("objective", "bound", "gap_rel", "closed"),
+    [
+        (4200, 4200, None, True),
+        (4200, 4199.2, None, True),  # costs are integers: < 1 apart proves it
+        (4201, 4200, None, False),
+        (4_303_699, 16_800, None, False),  # what cuOpt once called "Optimal"
+        (101, 100, 0.01, True),
+        (103, 100, 0.01, False),
+    ],
+)
+def test_gap_closed(objective: float, bound: float, gap_rel: float | None, closed: bool) -> None:
+    assert _gap_closed(objective, bound, gap_rel) is closed
 
 
 # --- properties ---------------------------------------------------------------------------
