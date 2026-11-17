@@ -3,7 +3,7 @@
 from cuopt_scheduler.data import Assignment, Employee, Problem, generate_problem
 from cuopt_scheduler.model import build_model
 from cuopt_scheduler.solver import Backend, Outcome, SolveResult, cuopt_available, solve
-from cuopt_scheduler.validate import coverage_gaps, violations
+from cuopt_scheduler.validate import coverage_gaps, schedule_cost, violations
 
 __all__ = [
     "Assignment",
@@ -16,6 +16,7 @@ __all__ = [
     "coverage_gaps",
     "cuopt_available",
     "generate_problem",
+    "schedule_cost",
     "solve",
     "violations",
 ]

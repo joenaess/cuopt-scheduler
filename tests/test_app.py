@@ -60,3 +60,13 @@ def test_compare_backends_when_gpu_available() -> None:
     assert not at.exception
     table = next(df.value for df in at.dataframe if "Solver" in df.value.columns)
     assert len(table) == 2
+
+
+def test_hardest_level_solves() -> None:
+    at = app()
+    at.select_slider[0].set_value(3)
+    force_cpu(at)
+    at.button[0].click().run()
+    assert not at.exception
+    assert "dislikes" in " ".join(c.value for c in at.caption)
+    assert at.success

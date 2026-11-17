@@ -14,6 +14,7 @@ from cuopt_scheduler import (
     generate_problem,
     solve,
 )
+from cuopt_scheduler.data import LEVELS
 from cuopt_scheduler.frames import demand_frame, employees_frame, gaps_frame, schedule_frame
 from cuopt_scheduler.viz import coverage_figure, gantt_figure
 
@@ -40,6 +41,13 @@ with st.sidebar:
         11,
         help="11h rules out Night→Day and Evening→Day on consecutive days.",
     )
+    level = st.select_slider(
+        "Difficulty",
+        options=sorted(LEVELS),
+        value=0,
+        help="\n\n".join(f"**{k}**: {v}" for k, v in LEVELS.items()),
+    )
+    st.caption(LEVELS[level])
     st.caption("Max hours apply per calendar week (24, 32 or 40 per employee).")
 
     st.divider()
@@ -69,7 +77,7 @@ with st.sidebar:
 
     if st.button("Generate & Solve", type="primary"):
         problem = dataclasses.replace(
-            generate_problem(num_emp, duration, seed=int(seed), wards=wards),
+            generate_problem(num_emp, duration, seed=int(seed), wards=wards, level=level),
             min_rest_hours=min_rest,
         )
         primary = Backend.GPU if use_gpu else Backend.CPU

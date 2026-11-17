@@ -13,16 +13,12 @@ from dataclasses import dataclass
 import numpy as np
 import numpy.typing as npt
 
-from cuopt_scheduler.data import Problem
+from cuopt_scheduler.data import DISLIKE_COST, SHIFT_COST, UNCOVERED_PENALTY, Problem
 
 VarKey = tuple[str, str, int]  # (employee_id, shift, day)
 GapKey = tuple[int, str, str]  # (day, shift, skill)
 FloatArray = npt.NDArray[np.float64]
 IntArray = npt.NDArray[np.int32]
-
-# Cost of leaving one required staff slot empty, in "shifts". It must exceed the most shifts
-# that covering one more slot could ever add, so coverage always comes first.
-UNCOVERED_PENALTY = 1000
 
 
 @dataclass(frozen=True, eq=False)
@@ -121,7 +117,19 @@ def build_model(problem: Problem) -> ScheduleModel:
     # 3. At most one shift per day.
     blocks.append(_Block(x.transpose(0, 2, 1).reshape(-1, n_shift), -np.inf, 1.0))
 
-    # 4. Minimum rest between consecutive days' shifts.
+    # 4. Most days in a row: any window of k + 1 days has at most k working days.
+    if (k := problem.max_consecutive_days) is not None:
+        for start in range(n_day - k):
+            window = x[:, :, start : start + k + 1].reshape(n_emp, -1)
+            blocks.append(_Block(window, -np.inf, float(k)))
+
+    # 5. Per-shift weekly caps (e.g. nights).
+    for s, cap in problem.weekly_shift_caps.items():
+        si = shifts.index(s)
+        for week in problem.weeks:
+            blocks.append(_Block(x[:, si, week.start : week.stop], -np.inf, float(cap)))
+
+    # 6. Minimum rest between consecutive days' shifts.
     for today, tomorrow in rest_conflicts(problem):
         t, m = shifts.index(today), shifts.index(tomorrow)
         pairs = np.stack([x[:, t, :-1], x[:, m, 1:]], axis=-1).reshape(-1, 2)
@@ -129,18 +137,25 @@ def build_model(problem: Problem) -> ScheduleModel:
 
     n_cols = n_x + len(gap_keys)
     col_upper = np.concatenate([np.ones(n_x), np.array(gap_upper)])
-    # 5. Availability, as a column bound rather than a constraint.
+    cost = np.concatenate(
+        [np.full(n_x, float(SHIFT_COST)), np.full(len(gap_keys), float(UNCOVERED_PENALTY))]
+    )
     for i, e in enumerate(employees):
+        # 7. Availability, as a column bound rather than a constraint.
         for d, s in e.unavailable:
             if d in days and s in shifts:
                 col_upper[x[i, shifts.index(s), d]] = 0.0
+        for d, s in e.dislikes:
+            if d in days and s in shifts:
+                cost[x[i, shifts.index(s), d]] += DISLIKE_COST
 
     lengths = np.concatenate([np.full(len(b.cols), b.cols.shape[1]) for b in blocks])
     return ScheduleModel(
         x_keys=tuple((e.id, s, d) for e, s, d in itertools.product(employees, shifts, days)),
         gap_keys=tuple(gap_keys),
-        # Objective: cover as much demand as possible, then use as few shifts as possible.
-        cost=np.concatenate([np.ones(n_x), np.full(len(gap_keys), float(UNCOVERED_PENALTY))]),
+        # Objective: cover as much demand as possible, then use as few (and as few disliked)
+        # shifts as possible.
+        cost=cost,
         col_lower=np.zeros(n_cols),
         col_upper=col_upper,
         integer=np.arange(n_cols) < n_x,
