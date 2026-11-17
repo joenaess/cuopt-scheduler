@@ -6,8 +6,8 @@ Both solvers get the same arrays from `build_model`, through their own Python AP
 from __future__ import annotations
 
 import contextlib
-import math
 import functools
+import math
 import os
 import sys
 import time
