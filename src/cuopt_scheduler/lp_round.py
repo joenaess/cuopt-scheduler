@@ -7,8 +7,10 @@ packing row (a sum of assignments <= a limit): assignments are only ever added w
 packing row they touch still has room. Demand rows have a slack column that absorbs any
 shortfall.
 
-LP engines: HiGHS on the CPU (dual simplex, interior point, or PDLP), and on the GPU cuOpt's
-PDLP or cuPDLPx (optional `pdlp` extra).
+LP engines: HiGHS on the CPU (dual simplex or PDLP) and cuOpt's PDLP on the GPU.
+
+`solve_warm_started` goes one step further on the GPU: it hands the rounded schedule to
+cuOpt's MILP solver as a starting point, which then only has to prove it (or improve it).
 """
 
 from __future__ import annotations
@@ -21,73 +23,45 @@ import numpy as np
 from cuopt_scheduler.data import Problem
 from cuopt_scheduler.model import FloatArray, ScheduleModel, build_model
 from cuopt_scheduler.solver import (
-    Assignment,
     Backend,
-    Outcome,
+    RawSolution,
     SolveResult,
     _quiet_stdout,
-    classify,
+    _solve_cuopt,
     cuopt_data_model,
     highs_model,
+    make_result,
 )
+
+CUOPT_PDLP_PARAMS: dict[str, int | float] = {
+    "method": 1,  # PDLP
+    # Stable2 was about twice as fast as 26.10's default (Stable3) on this model, with the
+    # same rounded schedules (docs/benchmarks/README.md).
+    "pdlp_solver_mode": 1,
+}
 
 
 class LPEngine(StrEnum):
     HIGHS = "highs"
     """CPU: HiGHS's default LP method (dual simplex)."""
-    HIGHS_IPM = "highs-ipm"
-    """CPU: HiGHS's interior-point method, without crossover."""
     HIGHS_PDLP = "highs-pdlp"
     """CPU: HiGHS's first-order PDLP."""
     CUOPT_PDLP = "cuopt-pdlp"
     """GPU: cuOpt's first-order PDLP."""
-    CUPDLPX = "cupdlpx"
-    """GPU: cuPDLPx (MIT), needs the `pdlp` extra."""
 
     @property
     def backend(self) -> Backend:
-        return Backend.GPU if self in (LPEngine.CUOPT_PDLP, LPEngine.CUPDLPX) else Backend.CPU
-
-
-def cupdlpx_available() -> bool:
-    try:
-        import cupdlpx  # noqa: F401  # pyright: ignore[reportMissingImports]
-    except ImportError:
-        return False
-    return True
+        return Backend.GPU if self is LPEngine.CUOPT_PDLP else Backend.CPU
 
 
 def solve_lp(model: ScheduleModel, engine: LPEngine, time_limit: float) -> FloatArray:
     """The LP relaxation's (approximate, for PDLP) optimal solution."""
     if engine.backend is Backend.CPU:
         h = highs_model(model, time_limit, relax=True)
-        if engine is LPEngine.HIGHS_IPM:
-            h.setOptionValue("solver", "ipm")
-            h.setOptionValue("run_crossover", "off")
-        elif engine is LPEngine.HIGHS_PDLP:
+        if engine is LPEngine.HIGHS_PDLP:
             h.setOptionValue("solver", "pdlp")
         h.run()
         return np.asarray(h.getSolution().col_value)
-
-    if engine is LPEngine.CUPDLPX:
-        import cupdlpx  # pyright: ignore[reportMissingImports]
-        import scipy.sparse as sp  # pyright: ignore[reportMissingImports]
-
-        a = sp.csr_matrix(
-            (model.values, model.indices, model.offsets), shape=(model.num_rows, model.num_cols)
-        )
-        m = cupdlpx.Model(
-            objective_vector=model.cost,
-            constraint_matrix=a,
-            constraint_lower_bound=model.row_lower,
-            constraint_upper_bound=model.row_upper,
-            variable_lower_bound=model.col_lower,
-            variable_upper_bound=model.col_upper,
-        )
-        m.setParams(OutputFlag=False, TimeLimit=float(time_limit))
-        with _quiet_stdout():
-            m.optimize()
-        return np.asarray(m.X, dtype=np.float64)
 
     from cuopt.linear_programming import solver, solver_settings  # pyright: ignore[reportMissingImports]
 
@@ -96,7 +70,8 @@ def solve_lp(model: ScheduleModel, engine: LPEngine, time_limit: float) -> Float
         settings = solver_settings.SolverSettings()
         settings.set_parameter("log_to_console", False)
         settings.set_parameter("time_limit", float(time_limit))
-        settings.set_parameter("method", 1)  # PDLP
+        for name, value in CUOPT_PDLP_PARAMS.items():
+            settings.set_parameter(name, value)
         solution = solver.Solve(dm, settings)
     return np.asarray(solution.get_primal_solution(), dtype=np.float64)
 
@@ -156,27 +131,40 @@ def solve_lp_round(
     build_seconds = time.perf_counter() - start
 
     start = time.perf_counter()
-    lp = solve_lp(model, engine, time_limit)
-    values = round_lp(model, lp)
+    values = round_lp(model, solve_lp(model, engine, time_limit))
     elapsed = time.perf_counter() - start
-
-    outcome = classify(model, values, proven=False)
-    if outcome is Outcome.NO_SOLUTION:
-        raise AssertionError("rounding produced an invalid schedule")  # a bug, not bad luck
-    chosen = np.flatnonzero(values[: len(model.x_keys)] > 0.5)
     objective = float(model.cost @ values)
-    return SolveResult(
-        outcome=outcome,
-        solver_status=f"LP ({engine}) + rounding",
-        backend=engine.backend,
-        solve_seconds=elapsed,
-        objective=objective,
-        assignments=tuple(
-            sorted(
-                Assignment(day=d, shift=s, employee_id=e)
-                for e, s, d in (model.x_keys[i] for i in chosen)
-            )
-        ),
-        build_seconds=build_seconds,
-        incumbents=((elapsed, objective),),
-    )
+    raw = RawSolution(values, False, f"LP ({engine}) + rounding", ((elapsed, objective),))
+    return _checked(make_result(model, raw, engine.backend, elapsed, build_seconds))
+
+
+def solve_warm_started(
+    problem: Problem, time_limit: float = 30, gap_rel: float | None = None
+) -> SolveResult:
+    """cuOpt PDLP + rounding, then cuOpt's MILP solver starting from that schedule.
+
+    Has a good schedule as soon as the LP is solved, and can still prove it optimal. The
+    time limit covers both steps.
+    """
+    start = time.perf_counter()
+    model = build_model(problem)
+    build_seconds = time.perf_counter() - start
+
+    start = time.perf_counter()
+    rounded = round_lp(model, solve_lp(model, LPEngine.CUOPT_PDLP, time_limit))
+    t_lp = time.perf_counter() - start
+    remaining = max(1.0, time_limit - t_lp)
+    raw = _solve_cuopt(model, remaining, gap_rel, initial=rounded)
+    elapsed = time.perf_counter() - start
+    trace = ((t_lp, float(model.cost @ rounded)), *((t_lp + t, o) for t, o in raw.incumbents))
+    if raw.values is None:  # cuOpt returned nothing better: keep the rounded schedule
+        raw = RawSolution(rounded, False, raw.status, trace)
+    else:
+        raw = RawSolution(raw.values, raw.proven, raw.status, trace)
+    return _checked(make_result(model, raw, Backend.GPU, elapsed, build_seconds))
+
+
+def _checked(result: SolveResult) -> SolveResult:
+    if not result.feasible:
+        raise AssertionError("rounding produced an invalid schedule")  # a bug, not bad luck
+    return result

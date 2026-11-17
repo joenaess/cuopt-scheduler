@@ -2,9 +2,10 @@
 
     uv run cuopt-bench --wards 5 20 80 --levels 0 3 --csv results.csv
 
-Methods: the two exact MILP solvers (HiGHS on CPU, cuOpt on GPU), and LP relaxation plus
-rounding (`lp_round`) with an LP engine on CPU (HiGHS simplex, IPM, PDLP) or GPU (cuOpt
-PDLP, cuPDLPx). Methods whose solver isn't installed are skipped.
+Methods: the two exact MILP solvers (HiGHS on CPU, cuOpt on GPU); LP relaxation plus
+rounding (`lp_round`) with HiGHS (simplex or PDLP) on the CPU or cuOpt PDLP on the GPU; and
+cuOpt's MILP solver started from cuOpt's rounded LP schedule. GPU methods are skipped when
+cuOpt can't run.
 
 Each problem has `--staff-per-ward` employees per ward. The default (34) is deliberately
 tight, which makes the problem hard enough to be interesting; around 45 per ward covers all
@@ -28,7 +29,7 @@ from pathlib import Path
 import pandas as pd
 
 from cuopt_scheduler.data import LEVELS, Problem, generate_problem
-from cuopt_scheduler.lp_round import LPEngine, cupdlpx_available, solve_lp_round
+from cuopt_scheduler.lp_round import LPEngine, solve_lp_round, solve_warm_started
 from cuopt_scheduler.solver import Backend, SolveResult, cuopt_available, solve
 from cuopt_scheduler.validate import coverage_gaps, violations
 
@@ -36,39 +37,36 @@ from cuopt_scheduler.validate import coverage_gaps, violations
 class Method(StrEnum):
     HIGHS_MIP = "highs-mip"
     CUOPT_MIP = "cuopt-mip"
+    CUOPT_MIP_WARM = "cuopt-pdlp+round+mip"
     HIGHS_SIMPLEX_ROUND = "highs-simplex+round"
-    HIGHS_IPM_ROUND = "highs-ipm+round"
     HIGHS_PDLP_ROUND = "highs-pdlp+round"
     CUOPT_PDLP_ROUND = "cuopt-pdlp+round"
-    CUPDLPX_ROUND = "cupdlpx+round"
 
     @property
     def lp_engine(self) -> LPEngine | None:
         return {
             Method.HIGHS_SIMPLEX_ROUND: LPEngine.HIGHS,
-            Method.HIGHS_IPM_ROUND: LPEngine.HIGHS_IPM,
             Method.HIGHS_PDLP_ROUND: LPEngine.HIGHS_PDLP,
             Method.CUOPT_PDLP_ROUND: LPEngine.CUOPT_PDLP,
-            Method.CUPDLPX_ROUND: LPEngine.CUPDLPX,
         }.get(self)
 
     @property
     def device(self) -> Backend:
         if self is Method.HIGHS_MIP:
             return Backend.CPU
-        if self is Method.CUOPT_MIP:
+        if self in (Method.CUOPT_MIP, Method.CUOPT_MIP_WARM):
             return Backend.GPU
         assert self.lp_engine is not None
         return self.lp_engine.backend
 
     def available(self) -> bool:
-        if self is Method.CUPDLPX_ROUND:
-            return cupdlpx_available()
         return self.device is Backend.CPU or cuopt_available()
 
     def run(self, problem: Problem, time_limit: float, gap_rel: float | None) -> SolveResult:
         if engine := self.lp_engine:
             return solve_lp_round(problem, engine, time_limit)
+        if self is Method.CUOPT_MIP_WARM:
+            return solve_warm_started(problem, time_limit, gap_rel)
         result = solve(problem, self.device, time_limit=time_limit, gap_rel=gap_rel)
         if result.backend is not self.device:
             raise RuntimeError(f"{self} fell back to {result.backend}: {result.warnings}")

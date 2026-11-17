@@ -15,6 +15,7 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
 import highspy
 import numpy as np
@@ -27,6 +28,17 @@ __all__ = ["Assignment", "Backend", "Outcome", "SolveResult", "cuopt_available",
 # Every cost is an integer, so a bound within less than 1 of the best schedule proves it
 # optimal. Both solvers get this, so neither keeps searching for a better score that can't exist.
 _ABS_GAP = 0.999
+
+CUOPT_MIP_PARAMS: dict[str, int | float] = {
+    # cuOpt 26.10's default presolve (Papilo plus its own) spent 59 of 60 s on a 40-ward
+    # problem without finishing; with it off, cuOpt proves the optimum in 8 s. This model
+    # has little for presolve to remove anyway.
+    "presolve": 0,
+    # Solve the root LP with PDLP rather than racing it against dual simplex ("concurrent"):
+    # on large instances the race was won by a 31 s dual simplex.
+    "method": 1,
+}
+"""Settings on top of cuOpt's defaults for MILP solves (see docs/benchmarks/README.md)."""
 
 
 class Backend(StrEnum):
@@ -65,7 +77,7 @@ class SolveResult:
 
 
 @dataclass(frozen=True)
-class _Raw:
+class RawSolution:
     values: FloatArray | None
     proven: bool
     """The solver proved this solution optimal (within the requested gap)."""
@@ -124,7 +136,7 @@ def highs_model(model: ScheduleModel, time_limit: float, *, relax: bool = False)
     return h
 
 
-def cuopt_data_model(model: ScheduleModel, *, relax: bool = False) -> object:
+def cuopt_data_model(model: ScheduleModel, *, relax: bool = False) -> Any:
     """A cuOpt DataModel holding `model` (as an LP if `relax`)."""
     from cuopt.linear_programming import data_model  # pyright: ignore[reportMissingImports]
 
@@ -139,7 +151,7 @@ def cuopt_data_model(model: ScheduleModel, *, relax: bool = False) -> object:
     return dm
 
 
-def _solve_highs(model: ScheduleModel, time_limit: float, gap_rel: float | None) -> _Raw:
+def _solve_highs(model: ScheduleModel, time_limit: float, gap_rel: float | None) -> RawSolution:
     start = time.perf_counter()
     trace: list[tuple[float, float]] = []
     h = highs_model(model, time_limit)
@@ -154,7 +166,7 @@ def _solve_highs(model: ScheduleModel, time_limit: float, gap_rel: float | None)
     info = h.getInfo()
     has_solution = info.primal_solution_status == highspy.SolutionStatus.kSolutionStatusFeasible
     claimed = status == highspy.HighsModelStatus.kOptimal
-    return _Raw(
+    return RawSolution(
         values=np.asarray(h.getSolution().col_value) if has_solution else None,
         proven=claimed and _gap_closed(info.objective_function_value, info.mip_dual_bound, gap_rel),
         status=h.modelStatusToString(status),
@@ -162,7 +174,13 @@ def _solve_highs(model: ScheduleModel, time_limit: float, gap_rel: float | None)
     )
 
 
-def _solve_cuopt(model: ScheduleModel, time_limit: float, gap_rel: float | None) -> _Raw:
+def _solve_cuopt(
+    model: ScheduleModel,
+    time_limit: float,
+    gap_rel: float | None,
+    initial: FloatArray | None = None,
+) -> RawSolution:
+    """cuOpt MILP; `initial` is an optional valid schedule (all columns) to begin from."""
     from cuopt.linear_programming import (  # pyright: ignore[reportMissingImports]
         solver,
         solver_settings,
@@ -189,16 +207,16 @@ def _solve_cuopt(model: ScheduleModel, time_limit: float, gap_rel: float | None)
             trace.append((time.perf_counter() - start, float(solution_cost[0])))
 
     dm = cuopt_data_model(model)
+    if initial is not None:
+        dm.set_initial_primal_solution(np.asarray(initial, dtype=np.float64))
     with _quiet_stdout():
         settings = solver_settings.SolverSettings()
         settings.set_parameter("log_to_console", False)
         settings.set_parameter("time_limit", float(time_limit))
         settings.set_parameter("mip_relative_gap", float(gap_rel or 0.0))
         settings.set_parameter("mip_absolute_gap", _ABS_GAP)
-        # cuOpt 26.10's default presolve (Papilo plus its own) spent 59 of 60 s on a
-        # 40-ward problem without finishing; with it off, cuOpt proves the optimum in 8 s.
-        # This model has little for presolve to remove anyway.
-        settings.set_parameter("presolve", 0)
+        for name, value in CUOPT_MIP_PARAMS.items():
+            settings.set_parameter(name, value)
         callback = Trace()
         settings.set_mip_callback(callback, None)
         solution = solver.Solve(dm, settings)
@@ -214,7 +232,7 @@ def _solve_cuopt(model: ScheduleModel, time_limit: float, gap_rel: float | None)
     name = status.name
     if status == MILPTerminationStatus.Optimal and not proven:
         name += f" (unproven: objective {objective:g}, bound {bound:g})"
-    return _Raw(
+    return RawSolution(
         values=values if len(values) else None,
         proven=proven,
         status=name,
@@ -291,6 +309,18 @@ def solve(
         raw = _SOLVERS[backend](model, time_limit, gap_rel)
     elapsed = time.perf_counter() - start
 
+    return make_result(model, raw, backend, elapsed, build_seconds, tuple(warnings))
+
+
+def make_result(
+    model: ScheduleModel,
+    raw: RawSolution,
+    backend: Backend,
+    solve_seconds: float,
+    build_seconds: float,
+    warnings: tuple[str, ...] = (),
+) -> SolveResult:
+    """Check a solver's answer against `model` and turn it into a SolveResult."""
     outcome = classify(model, raw.values, raw.proven)
     assignments: tuple[Assignment, ...] = ()
     objective = None
@@ -303,16 +333,16 @@ def solve(
                 for emp, s, d in (model.x_keys[i] for i in chosen)
             )
         )
-        # Recomputed from the rounded solution, so both backends report it the same way.
+        # Recomputed from the rounded solution, so every method reports it the same way.
         objective = float(model.cost @ np.round(raw.values, 6))
     return SolveResult(
         outcome=outcome,
         solver_status=raw.status,
         backend=backend,
-        solve_seconds=elapsed,
+        solve_seconds=solve_seconds,
         objective=objective,
         assignments=assignments,
-        warnings=tuple(warnings),
+        warnings=warnings,
         build_seconds=build_seconds,
         incumbents=raw.incumbents,
     )

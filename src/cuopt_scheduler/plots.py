@@ -19,12 +19,13 @@ from pathlib import Path
 
 import pandas as pd
 
-# The four methods the charts follow, in fixed colour order. Tables in the README cover all.
+# The methods the charts follow, in fixed colour order. Tables in the README cover all.
 SERIES: dict[str, str] = {
     "highs-mip": "HiGHS MILP (CPU)",
     "cuopt-mip": "cuOpt MILP (GPU)",
     "highs-pdlp+round": "HiGHS PDLP + rounding (CPU)",
     "cuopt-pdlp+round": "cuOpt PDLP + rounding (GPU)",
+    "cuopt-pdlp+round+mip": "cuOpt MILP from rounding (GPU)",
 }
 
 
@@ -48,7 +49,7 @@ LIGHT = Theme(
     muted="#898781",
     grid="#e1e0d9",
     axis="#c3c2b7",
-    series=("#2a78d6", "#eb6834", "#1baf7a", "#eda100"),
+    series=("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"),
 )
 DARK = Theme(
     "dark",
@@ -58,7 +59,7 @@ DARK = Theme(
     muted="#898781",
     grid="#2c2c2a",
     axis="#383835",
-    series=("#3987e5", "#d95926", "#199e70", "#c98500"),
+    series=("#3987e5", "#d95926", "#199e70", "#c98500", "#d55181"),
 )
 
 
@@ -151,7 +152,7 @@ def _method_lines(ax, data: pd.DataFrame, x: str, theme: Theme, limit: float) ->
         if rows.empty:
             continue
         med = pd.Series(rows.groupby(x)["near_seconds"].median()).sort_index()
-        style = "-" if method.startswith(("cuopt", "cupdlpx")) else "--"
+        style = "-" if method.startswith("cuopt") else "--"
         hit = med.dropna()
         ax.plot(hit.index, hit.values, style, color=colour, linewidth=2, marker="o", markersize=5)
         missed = [i for i, v in med.items() if pd.isna(v)]

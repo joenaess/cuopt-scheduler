@@ -60,7 +60,6 @@ def test_cli_prints_table_and_writes_csv(
     tmp_path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("cuopt_scheduler.benchmark.cuopt_available", lambda: False)
-    monkeypatch.setattr("cuopt_scheduler.benchmark.cupdlpx_available", lambda: False)
     out = tmp_path / "bench.csv"
     main(["--wards", "1", "--days", "7", "--time-limit", "10", "--csv", str(out)])
     printed = capsys.readouterr().out

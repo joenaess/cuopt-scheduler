@@ -6,7 +6,7 @@ from hypothesis.extra.numpy import arrays
 
 from cuopt_scheduler import Backend, Outcome, Problem, generate_problem, schedule_cost, solve
 from cuopt_scheduler.data import LEVELS
-from cuopt_scheduler.lp_round import LPEngine, cupdlpx_available, round_lp, solve_lp_round
+from cuopt_scheduler.lp_round import LPEngine, round_lp, solve_lp_round, solve_warm_started
 from cuopt_scheduler.model import build_model
 from cuopt_scheduler.solver import classify
 
@@ -53,13 +53,25 @@ def test_lp_round_matches_the_exact_optimum_here(engine: LPEngine) -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("engine", [LPEngine.CUOPT_PDLP, LPEngine.CUPDLPX])
-def test_gpu_lp_round(engine: LPEngine) -> None:
-    if engine is LPEngine.CUPDLPX and not cupdlpx_available():
-        pytest.skip("cuPDLPx not installed (uv sync --extra pdlp)")
+def test_gpu_lp_round() -> None:
     problem = generate_problem(45, 14, seed=1, level=3)
-    result = solve_lp_round(problem, engine)
+    result = solve_lp_round(problem, LPEngine.CUOPT_PDLP)
     assert result.backend is Backend.GPU
     assert result.objective == schedule_cost(problem, result.assignments)
     # PDLP solves the LP only approximately; allow a few extra shifts but no lost coverage.
     assert result.objective == pytest.approx(solve(problem).objective, abs=5)
+
+
+@pytest.mark.gpu
+def test_warm_started_mip_proves_the_rounded_schedule() -> None:
+    problem = generate_problem(68, 14, seed=2, wards=2, level=3)
+    result = solve_warm_started(problem, time_limit=60)
+    assert result.backend is Backend.GPU
+    assert result.outcome is Outcome.OPTIMAL
+    assert result.objective == solve(problem).objective
+    assert result.objective == schedule_cost(problem, result.assignments)
+    # The trace starts with the rounded LP schedule, before the MILP solver runs.
+    assert result.objective is not None
+    first_t, first_obj = result.incumbents[0]
+    assert first_t <= result.solve_seconds
+    assert first_obj >= result.objective
