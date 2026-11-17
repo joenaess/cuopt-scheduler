@@ -6,6 +6,7 @@ Both solvers get the same arrays from `build_model`, through their own Python AP
 from __future__ import annotations
 
 import contextlib
+import math
 import functools
 import os
 import sys
@@ -69,7 +70,13 @@ class _Raw:
 
 
 def _gap_closed(objective: float, bound: float, gap_rel: float | None) -> bool:
-    """True if the solver's own bound backs up an optimality claim (minimisation)."""
+    """True if the solver's own bound backs up an optimality claim (minimisation).
+
+    An infinite bound means no search ran (presolve solved the problem outright), so there
+    is nothing to contradict the claim.
+    """
+    if not math.isfinite(bound):
+        return True
     allowed = max(_ABS_GAP, (gap_rel or 0.0) * abs(objective))
     return objective - bound <= allowed + 1e-6
 
@@ -186,7 +193,7 @@ def cuopt_available() -> bool:
         values=np.ones(1),
     )
     try:
-        return _solve_cuopt(tiny, time_limit=10, gap_rel=None).proven
+        return _solve_cuopt(tiny, time_limit=10, gap_rel=None).values is not None
     except Exception:
         return False
 

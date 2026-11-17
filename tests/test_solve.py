@@ -158,6 +158,7 @@ def test_classify_rejects_invalid(tiny: ScheduleModel, values: list[float] | Non
         (4_303_699, 16_800, None, False),  # what cuOpt once called "Optimal"
         (101, 100, 0.01, True),
         (103, 100, 0.01, False),
+        (1, float("-inf"), None, True),  # cuOpt when presolve solves it outright
     ],
 )
 def test_gap_closed(objective: float, bound: float, gap_rel: float | None, closed: bool) -> None:
