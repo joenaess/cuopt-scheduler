@@ -2,7 +2,7 @@
 
 A high-performance, GPU-accelerated staff scheduling application powered by **NVIDIA cuOpt** and **Streamlit**. 
 
-This project solves a nurse rostering problem as a mixed-integer program, on a local NVIDIA GPU with cuOpt or on the CPU with CBC, and includes a benchmark to compare the two honestly (see [GPU vs CPU](#-gpu-vs-cpu)).
+This project solves a nurse rostering problem as a mixed-integer program, on a local NVIDIA GPU with cuOpt or on the CPU with HiGHS, and includes a benchmark to compare the two honestly (see [GPU vs CPU](#-gpu-vs-cpu)).
 
 ![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
 ![NVIDIA](https://img.shields.io/badge/NVIDIA-cuOpt-green)
@@ -10,7 +10,7 @@ This project solves a nurse rostering problem as a mixed-integer program, on a l
 
 ## 🚀 Features
 
-* **GPU or CPU:** Solves with NVIDIA cuOpt via PuLP, with automatic fallback to CBC on CPU, and can solve the same problem on both side by side.
+* **GPU or CPU:** Solves with NVIDIA cuOpt, with automatic fallback to HiGHS on CPU, and can solve the same problem on both side by side.
 * **Realistic Simulation:** Generates "fake" but realistic employee profiles (names, skills, availability) using `Faker`.
 * **Interactive Visualization:**
 
@@ -25,7 +25,7 @@ This project solves a nurse rostering problem as a mixed-integer program, on a l
 ## 🛠️ Prerequisites
 
 * **Python:** 3.11+ and [uv](https://docs.astral.sh/uv/).
-* **For the GPU solver (optional):** Linux or WSL2, an NVIDIA GPU (RTX 30/40-series recommended) and drivers supporting CUDA 13. Without one the app runs on the CPU solver (CBC).
+* **For the GPU solver (optional):** Linux or WSL2, an NVIDIA GPU (RTX 30/40-series recommended) and drivers supporting CUDA 13. Without one the app runs on the CPU solver (HiGHS).
 
 ## 📦 Installation
 
@@ -56,16 +56,18 @@ uv run cuopt-bench --wards 1 10 20 --days 28 --time-limit 60
 uv run cuopt-bench --help
 ```
 
-Each run is checked by the independent validator. Typical results (cuOpt's numbers vary between runs because its heuristics run in parallel) on an RTX 4080 Laptop GPU and an i9-13980HX, with cuOpt 25.10.1, CBC 2.10.3, 28 days and 34 employees per ward (deliberately tight):
+Both solvers get the identical model arrays, and each result is checked by the independent validator. Building the model is timed separately and takes at most 0.04 s here. Results for seeds 0 and 1 (cuOpt's numbers vary between runs because its heuristics run in parallel) on an RTX 4080 Laptop GPU and an i9-13980HX, with cuOpt 25.10.1, HiGHS 1.16, 28 days, 34 employees per ward (deliberately tight) and a 60 s limit:
 
-| Wards | Employees | CBC (CPU) | cuOpt (GPU) |
+| Wards | Employees | HiGHS (CPU) | cuOpt (GPU) |
 |---|---|---|---|
-| 1 | 34 | 0.10 s, optimal | 0.24 s, optimal |
-| 10 | 340 | 0.80 s, optimal | 60 s time limit, within 0.1% |
-| 20 | 680 | 1.5–1.9 s, optimal | 60 s time limit; 0–390 slots uncovered, varying between runs |
-| 40 | 1360 | 3.4–4.8 s, optimal | 60 s time limit; 539–855 slots uncovered, or no solution |
+| 1 | 34 | 0.08–0.11 s, optimal | 0.21–0.26 s, optimal |
+| 5 | 170 | 0.36–0.75 s, optimal | 2.6 s, optimal |
+| 10 | 340 | 1.0–1.7 s, optimal | 60 s time limit; optimal schedule found |
+| 20 | 680 | 2.2–2.6 s, optimal | 60 s time limit; 0–335 slots uncovered |
+| 40 | 1360 | 5.7–7.9 s, optimal | 60 s time limit; 115–857 slots uncovered |
+| 80 | 2720 | 16–20 s, optimal | 60 s time limit; 380–501 slots uncovered |
 
-**For this model, CBC wins at every size tested.** cuOpt finds a near-optimal schedule quickly (within 0.1% after about 1.5 s at 10 wards). But cuOpt 25.10 runs its branch-and-bound proof search on CPU threads, and in these runs it didn't stop at the requested `mip_relative_gap`, so it runs to the time limit. Meanwhile CBC solves this kind of assignment problem almost directly from its initial LP relaxation. Re-run the benchmark after upgrading cuOpt.
+**For this model, the CPU wins at every size tested.** cuOpt is called directly, with the same gap settings as HiGHS, so this is cuOpt itself, not a wrapper. At these sizes the problem is mostly about proving optimality, and cuOpt 25.10 runs that search on CPU threads. Even when given the optimal schedule as its starting point (through its solution callback; `DataModel.set_initial_primal_solution` fails for MIPs in 25.10), it needed 9 s to prove it at 10 wards, where HiGHS takes 1–2 s in total. Re-run the benchmark after upgrading cuOpt.
 
 ## 🧪 Development
 
@@ -86,7 +88,7 @@ cuopt-scheduler/
 ├── app.py                    # Streamlit UI only
 ├── src/cuopt_scheduler/
 │   ├── data.py               # Problem definition and synthetic data generation
-│   ├── model.py              # MILP formulation (PuLP)
+│   ├── model.py              # MILP formulation as sparse arrays (numpy)
 │   ├── solver.py             # CPU/GPU solving with fallback
 │   ├── validate.py           # Independent schedule checker
 │   ├── frames.py             # DataFrames for display and CSV export
@@ -100,17 +102,17 @@ cuopt-scheduler/
 ## 🧠 How It Works
 
 1. **Data Generation**: Creates a synthetic workforce with random availability and skills (RN, LPN, CNA).
-2. **Modeling**: Formulates the problem as a Mixed-Integer Linear Program (MILP) with PuLP.
+2. **Modeling**: Formulates the problem as a Mixed-Integer Linear Program (MILP), built directly as numpy arrays (costs, bounds and a sparse constraint matrix in CSR form). No modelling library sits in between, so building even the largest benchmark model takes a fraction of a second.
    * *Objective*: First cover as much demand as possible (each uncovered slot costs 1000), then use as few shifts as possible.
-   * *Constraints*: Staffing demand per skill (shortfall allowed but penalised), max hours per calendar week, availability, at most one shift per day, and minimum rest between consecutive days' shifts.
-3. **Solving**: On GPU, PuLP hands the model to the cuOpt library. On CPU, or if cuOpt is unavailable, it uses CBC. A result counts as a solution only if every variable has a value and every constraint holds, regardless of the solver's status code. It is "optimal" only if the solver also proved it.
+   * *Constraints*: Staffing demand per skill (shortfall allowed but penalised), max hours per calendar week, at most one shift per day, and minimum rest between consecutive days' shifts. Unavailability is a variable bound rather than a constraint.
+3. **Solving**: The same arrays go to cuOpt's Python API on GPU, or to HiGHS (`highspy`) on CPU, which is also the fallback if cuOpt is unavailable or fails. Both get the same stopping rules: the optional relative gap, and an absolute gap just under 1 (all costs are integers, so that already proves optimality). A result counts as a solution only if it passes our own check of every bound and constraint, regardless of the solver's status code. It is "optimal" only if the solver also proved it.
 4. **Visualization**: Results become pandas DataFrames rendered with Plotly.
 
 ## ⚠️ Troubleshooting
 
 * **GPU toggle is disabled**: cuOpt isn't available. Run `uv sync --extra gpu` and check `nvidia-smi`.
 * **"required staff slots could not be covered"**: Not enough staff for the demand. Add employees (about 45 per ward), or lower the minimum rest.
-* **"Time limit reached ... not proven optimal"**: The schedule is valid but may not be the best. Raise the time limit, set a gap, or try CBC.
+* **"Time limit reached ... not proven optimal"**: The schedule is valid but may not be the best. Raise the time limit, set a gap, or switch to the CPU solver.
 
 ## 📄 License
 

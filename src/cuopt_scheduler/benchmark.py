@@ -1,4 +1,4 @@
-"""Compare CPU (CBC) and GPU (cuOpt) on the same generated problems.
+"""Compare CPU (HiGHS) and GPU (cuOpt) on the same generated problems.
 
     uv run cuopt-bench --wards 1 5 10 20 --days 28 --seeds 3
 
@@ -30,6 +30,8 @@ class BenchmarkRow:
     backend: str
     outcome: str
     seconds: float
+    """Time in the solver. Building the model is timed separately."""
+    build_seconds: float
     objective: float | None
     uncovered: int | None
     """Required staff slots left empty (None if no solution was found)."""
@@ -64,6 +66,7 @@ def run_benchmark(
                     backend=str(result.backend),
                     outcome=str(result.outcome),
                     seconds=round(result.solve_seconds, 3),
+                    build_seconds=round(result.build_seconds, 3),
                     objective=result.objective,
                     uncovered=sum(coverage_gaps(problem, result.assignments).values())
                     if result.feasible

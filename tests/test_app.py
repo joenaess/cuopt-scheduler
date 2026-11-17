@@ -32,7 +32,7 @@ def test_default_settings_cover_all_demand() -> None:
     force_cpu(at)
     at.button[0].click().run()
     assert not at.exception
-    assert at.success and "Optimal schedule found with CPU (CBC)" in at.success[0].value
+    assert at.success and "Optimal schedule found with CPU (HiGHS)" in at.success[0].value
     assert not at.warning
     assert len(at.tabs) == 3
 
