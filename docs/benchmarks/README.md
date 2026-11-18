@@ -62,3 +62,32 @@ the MILP solver with `DataModel.set_initial_primal_solution`, which works for MI
 |---|---|---|
 | 1,360 employees, level 3 | 18 s | 8.3 s |
 | 2,720 employees, level 0 | 27–29 s | 21 s |
+
+## cuOpt 26.12 nightly (checked 2026-11-18)
+
+`cuopt-cu13 26.12.00a101` from the RAPIDS nightly index passes the test suite, but is no
+faster here, so the project stays on 26.10.1. Total / time until within 1%, 120 s limit (an
+empty cell means it never got within 1%):
+
+| Problem | Method | 26.10.1 | 26.12 nightly |
+|---|---|---|---|
+| 680 employees, level 3 | cuOpt MILP | 6.6 s / 4.6 s | 5.9 s / 3.8 s |
+| | MILP from rounding | 6.1 s / 0.16 s | 6.4 s / 0.19 s |
+| 2,720 employees, level 0 | cuOpt MILP | 27 s / 26 s | 33 s / 32 s |
+| | MILP from rounding | 21 s / 0.38 s | 20 s / 0.36 s |
+| 2,720 employees, level 3 | cuOpt MILP | 45 s / 41 s | 53 s / 52 s |
+| | MILP from rounding | 30 s / 0.56 s | 27 s / 0.58 s |
+| 5,440 employees, level 3 | cuOpt MILP | 121 s / – | 121 s / – |
+| | MILP from rounding | 121 s / 1.1 s | 122 s / 1.1 s |
+| 10,880 employees, level 0 | cuOpt MILP | 121 s / 90 s | 123 s / – (best 245,289 vs 134,400) |
+| | MILP from rounding | 123 s / 1.6 s | 122 s / 1.5 s |
+
+PDLP + rounding times were within 0.03 s of 26.10.1 on every problem. To try a nightly
+without touching `uv.lock`, install it into a separate environment:
+
+```bash
+uv venv /tmp/cuopt-nightly && VIRTUAL_ENV=/tmp/cuopt-nightly uv pip install --prerelease=allow \
+  --index-strategy unsafe-best-match \
+  --extra-index-url https://pypi.anaconda.org/rapidsai-wheels-nightly/simple \
+  --extra-index-url https://pypi.nvidia.com -e . "cuopt-cu13>=26.12.0a0,<26.13"
+```
