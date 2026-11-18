@@ -141,12 +141,21 @@ def round_lp(model: ScheduleModel, lp: FloatArray) -> FloatArray:
                     room[pack_rows[k]] -= pack_vals[k]
                 x[j] = 1.0
                 need -= 1
-    # Slack: whatever demand is still unmet.
-    activity = model.row_activity(x)
-    is_slack = ~on_x
+    return with_shortfall(model, x)
+
+
+def with_shortfall(model: ScheduleModel, x: FloatArray) -> FloatArray:
+    """`x` (all columns; only the assignment columns are read) with each demand row's slack
+    set to whatever demand the assignments leave unmet: a complete solution vector."""
+    n_x = len(model.x_keys)
+    v = np.zeros(model.num_cols)
+    v[:n_x] = x[:n_x]
+    rows_of = np.repeat(np.arange(model.num_rows), np.diff(model.offsets))
+    is_slack = model.indices >= n_x
     slack_rows, slack_cols = rows_of[is_slack], model.indices[is_slack]
-    x[slack_cols] = np.maximum(0.0, model.row_lower[slack_rows] - activity[slack_rows])
-    return x
+    activity = model.row_activity(v)
+    v[slack_cols] = np.maximum(0.0, model.row_lower[slack_rows] - activity[slack_rows])
+    return v
 
 
 def solve_lp_round(

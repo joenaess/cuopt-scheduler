@@ -35,7 +35,10 @@ def test_default_settings_cover_all_demand() -> None:
     assert at.success
     assert "Optimal schedule found with CPU (HiGHS)" in at.success[0].value
     assert not at.warning
-    assert len(at.tabs) == 3
+    assert len(at.tabs) == 4
+    # The "How it was solved" tab: the LP bound proves this schedule optimal.
+    assert any("bound proves this schedule optimal" in s.value for s in at.success)
+    assert any("Rule" in df.value.columns for df in at.dataframe)
 
 
 def test_understaffed_shows_uncovered_slots() -> None:
@@ -46,6 +49,9 @@ def test_understaffed_shows_uncovered_slots() -> None:
     assert not at.exception
     assert any("could not be covered" in w.value for w in at.warning)
     assert any("Missing" in df.value.columns for df in at.dataframe)
+    # The explanation tab says how optimality was proven: by the LP bound or by search.
+    verdicts = [m.value for m in [*at.success, *at.info]]
+    assert any("bound proves" in v or "closed it by **search**" in v for v in verdicts)
 
 
 def test_compare_backends_when_gpu_available() -> None:
