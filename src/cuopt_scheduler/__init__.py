@@ -1,4 +1,4 @@
-"""Nurse rostering demo: synthetic data, a PuLP MILP model, and CPU/GPU (cuOpt) solving."""
+"""Nurse rostering demo: synthetic data, a MILP model, and CPU (HiGHS) / GPU (cuOpt) solving."""
 
 from cuopt_scheduler.data import Assignment, Employee, Problem, generate_problem
 from cuopt_scheduler.model import build_model

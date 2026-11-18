@@ -1,26 +1,34 @@
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
-import pulp
+import numpy as np
 import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 from cuopt_scheduler import (
+    Assignment,
     Backend,
     Outcome,
     Problem,
+    SolveResult,
     coverage_gaps,
     generate_problem,
     solve,
     violations,
 )
-from cuopt_scheduler.model import UNCOVERED_PENALTY, build_model, rest_conflicts
-from cuopt_scheduler.solver import classify
+from cuopt_scheduler import solver as solver_module
+from cuopt_scheduler.model import UNCOVERED_PENALTY, ScheduleModel, build_model, rest_conflicts
+from cuopt_scheduler.solver import _gap_closed, classify
 
 from .conftest import SMALL_DEMAND, rn
 
 
-def expected_objective(problem: Problem, result) -> float:
+@dataclass(frozen=True)
+class SolveResultStub:
+    assignments: tuple[Assignment, ...]
+
+
+def expected_objective(problem: Problem, result: SolveResult | SolveResultStub) -> float:
     """Objective recomputed from the schedule via the independent validator."""
     gaps = coverage_gaps(problem, result.assignments)
     return UNCOVERED_PENALTY * sum(gaps.values()) + len(result.assignments)
@@ -28,8 +36,17 @@ def expected_objective(problem: Problem, result) -> float:
 
 def test_build_model_size(small_feasible: Problem) -> None:
     model = build_model(small_feasible)
-    assert len(model.x) == 3 * 2 * 3  # employees x shifts x days
-    assert len(model.uncovered) == 3 * 2  # days x (shift, skill)
+    assert len(model.x_keys) == 3 * 2 * 3  # employees x shifts x days
+    assert len(model.gap_keys) == 3 * 2  # days x (shift, skill)
+    assert model.num_cols == 18 + 6
+    assert model.offsets[-1] == len(model.indices) == len(model.values)
+
+
+def test_unavailability_is_a_column_bound() -> None:
+    p = Problem(employees=(rn("A", unavailable={(1, "Night")}),), num_days=2, demand=SMALL_DEMAND)
+    model = build_model(p)
+    blocked = [k for k, ub in zip(model.x_keys, model.col_upper, strict=False) if ub == 0]
+    assert blocked == [("A", "Night", 1)]
 
 
 def test_rest_conflicts_default_shifts() -> None:
@@ -93,40 +110,59 @@ def test_gap_tolerance_is_accepted(small_feasible: Problem) -> None:
     assert solve(small_feasible, gap_rel=0.05).outcome is Outcome.OPTIMAL
 
 
-# --- classify(): solver-independent result classification -------------------------------
+# --- classify(): our own check of the solver's answer --------------------------------------
 
 
-def tiny_lp(x_value: float | None, status: int, sol_status: int) -> pulp.LpProblem:
-    lp = pulp.LpProblem("t", pulp.LpMinimize)
-    x = pulp.LpVariable("x", cat=pulp.LpBinary)
-    lp += x
-    lp += x >= 1
-    x.varValue = x_value
-    lp.assignStatus(status, sol_status)
-    return lp
+@pytest.fixture
+def tiny() -> ScheduleModel:
+    # One binary x with x >= 1.
+    return ScheduleModel(
+        x_keys=(("A", "Day", 0),),
+        gap_keys=(),
+        cost=np.ones(1),
+        col_lower=np.zeros(1),
+        col_upper=np.ones(1),
+        integer=np.ones(1, dtype=np.bool_),
+        row_lower=np.ones(1),
+        row_upper=np.full(1, np.inf),
+        offsets=np.array([0, 1], np.int32),
+        indices=np.zeros(1, np.int32),
+        values=np.ones(1),
+    )
 
 
-def test_classify_optimal() -> None:
-    lp = tiny_lp(1, pulp.LpStatusOptimal, pulp.LpSolutionOptimal)
-    assert classify(lp) is Outcome.OPTIMAL
+@pytest.mark.parametrize(
+    ("proven", "expected"), [(True, Outcome.OPTIMAL), (False, Outcome.FEASIBLE)]
+)
+def test_classify_valid_solution(tiny: ScheduleModel, proven: bool, expected: Outcome) -> None:
+    assert classify(tiny, np.array([1.0]), proven) is expected
 
 
-def test_classify_cbc_time_limit_with_solution() -> None:
-    # CBC: status "Optimal" but only an integer-feasible solution.
-    lp = tiny_lp(1, pulp.LpStatusOptimal, pulp.LpSolutionIntegerFeasible)
-    assert classify(lp) is Outcome.FEASIBLE
+@pytest.mark.parametrize(
+    "values",
+    [None, [0.0], [0.5], [2.0], [np.nan], [1.0, 0.0]],
+    ids=["missing", "breaks-row", "fractional", "out-of-bounds", "nan", "wrong-length"],
+)
+def test_classify_rejects_invalid(tiny: ScheduleModel, values: list[float] | None) -> None:
+    arr = None if values is None else np.array(values)
+    # Even if the solver claims to have proven it.
+    assert classify(tiny, arr, proven=True) is Outcome.NO_SOLUTION
 
 
-def test_classify_cuopt_time_limit_with_solution() -> None:
-    # PuLP's cuOpt adapter: "Not Solved", but valid values loaded.
-    lp = tiny_lp(1, pulp.LpStatusNotSolved, pulp.LpSolutionNoSolutionFound)
-    assert classify(lp) is Outcome.FEASIBLE
-
-
-@pytest.mark.parametrize("value", [None, 0, 0.5])
-def test_classify_rejects_missing_invalid_or_fractional(value: float | None) -> None:
-    lp = tiny_lp(value, pulp.LpStatusNotSolved, pulp.LpSolutionNoSolutionFound)
-    assert classify(lp) is Outcome.NO_SOLUTION
+@pytest.mark.parametrize(
+    ("objective", "bound", "gap_rel", "closed"),
+    [
+        (4200, 4200, None, True),
+        (4200, 4199.2, None, True),  # costs are integers: < 1 apart proves it
+        (4201, 4200, None, False),
+        (4_303_699, 16_800, None, False),  # what cuOpt once called "Optimal"
+        (101, 100, 0.01, True),
+        (103, 100, 0.01, False),
+        (1, float("-inf"), None, True),  # cuOpt when presolve solves it outright
+    ],
+)
+def test_gap_closed(objective: float, bound: float, gap_rel: float | None, closed: bool) -> None:
+    assert _gap_closed(objective, bound, gap_rel) is closed
 
 
 # --- properties ---------------------------------------------------------------------------
@@ -150,6 +186,35 @@ def test_every_schedule_obeys_the_rules(
     assert result.objective == pytest.approx(expected_objective(problem, result))
 
 
+@settings(max_examples=50, deadline=None)
+@given(
+    num_employees=st.integers(3, 12),
+    num_days=st.integers(1, 9),
+    min_rest=st.integers(0, 16),
+    seed=st.integers(0, 2**32 - 1),
+    data=st.data(),
+)
+def test_model_agrees_with_validator(
+    num_employees: int, num_days: int, min_rest: int, seed: int, data: st.DataObject
+) -> None:
+    """Any schedule satisfies the model's rows exactly when the validator accepts it.
+
+    Ties the array encoding to the independent rule checker, without involving a solver.
+    """
+    problem = replace(generate_problem(num_employees, num_days, seed=seed), min_rest_hours=min_rest)
+    model = build_model(problem)
+    picked = data.draw(st.sets(st.sampled_from(range(len(model.x_keys))), max_size=40))
+    schedule = [
+        Assignment(day=d, shift=s, employee_id=e) for e, s, d in (model.x_keys[i] for i in picked)
+    ]
+    gaps = coverage_gaps(problem, schedule)
+    v = np.zeros(model.num_cols)
+    v[list(picked)] = 1
+    v[len(model.x_keys) :] = [gaps.get(k, 0) for k in model.gap_keys]
+    assert model.is_feasible(v) == (violations(problem, schedule) == [])
+    assert model.cost @ v == expected_objective(problem, SolveResultStub(tuple(schedule)))
+
+
 @pytest.mark.gpu
 @pytest.mark.parametrize("seed", [1, 2, 3])
 def test_gpu_matches_cpu(seed: int) -> None:
@@ -162,9 +227,21 @@ def test_gpu_matches_cpu(seed: int) -> None:
 
 
 @pytest.mark.gpu
-def test_gpu_gap_parameter_reaches_cuopt(small_feasible: Problem) -> None:
-    from cuopt_scheduler.solver import _solver
+def test_gpu_reports_its_own_backend(understaffed: Problem) -> None:
+    result = solve(understaffed, Backend.GPU, gap_rel=0.02)
+    assert (result.backend, result.warnings) == (Backend.GPU, ())
+    assert result.outcome is Outcome.OPTIMAL
+    assert coverage_gaps(understaffed, result.assignments) == {(1, "Night", "RN"): 1}
 
-    solver = _solver(Backend.GPU, time_limit=5, gap_rel=0.02)
-    assert solver.cuopt_params == {"mip_relative_gap": 0.02}  # pyright: ignore[reportAttributeAccessIssue]
-    assert solve(small_feasible, Backend.GPU, gap_rel=0.02).outcome is Outcome.OPTIMAL
+
+def test_gpu_failure_falls_back_to_cpu(
+    small_feasible: Problem, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(*args: object) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("cuopt_scheduler.solver.cuopt_available", lambda: True)
+    monkeypatch.setitem(solver_module._SOLVERS, Backend.GPU, broken)
+    result = solve(small_feasible, Backend.GPU)
+    assert result.backend is Backend.CPU and result.outcome is Outcome.OPTIMAL
+    assert result.warnings == ("cuOpt failed (boom); solved on CPU instead.",)

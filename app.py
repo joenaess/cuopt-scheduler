@@ -103,7 +103,7 @@ result = results[0]
 
 
 def engine(r: SolveResult) -> str:
-    return "🚀 NVIDIA cuOpt" if r.backend is Backend.GPU else "CPU (CBC)"
+    return "🚀 NVIDIA cuOpt" if r.backend is Backend.GPU else "CPU (HiGHS)"
 
 
 for warning in result.warnings:

@@ -1,18 +1,31 @@
-"""Solve a problem on CPU (CBC) or GPU (cuOpt), falling back to CPU when needed."""
+"""Solve a problem on CPU (HiGHS) or GPU (cuOpt), falling back to CPU when needed.
+
+Both solvers get the same arrays from `build_model`, through their own Python APIs.
+"""
 
 from __future__ import annotations
 
+import contextlib
+import functools
+import math
+import os
+import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import StrEnum
 
-import pulp
+import highspy
+import numpy as np
 
 from cuopt_scheduler.data import Assignment, Problem
-from cuopt_scheduler.model import build_model
+from cuopt_scheduler.model import FloatArray, ScheduleModel, build_model
 
 __all__ = ["Assignment", "Backend", "Outcome", "SolveResult", "cuopt_available", "solve"]
+
+# Every cost is an integer, so a bound within less than 1 of the best schedule proves it
+# optimal. Both solvers get this, so neither keeps searching for a better score that can't exist.
+_ABS_GAP = 0.999
 
 
 class Backend(StrEnum):
@@ -32,84 +45,171 @@ class Outcome(StrEnum):
 class SolveResult:
     outcome: Outcome
     solver_status: str
-    """Raw PuLP status string, for diagnostics."""
+    """The solver's own status, for diagnostics."""
     backend: Backend
     """The backend that actually produced the result."""
     solve_seconds: float
+    """Time in the solver, including handing it the model."""
     objective: float | None
     assignments: tuple[Assignment, ...]
     warnings: tuple[str, ...] = ()
+    build_seconds: float = 0.0
+    """Time to build the model arrays (shared by both backends)."""
 
     @property
     def feasible(self) -> bool:
         return self.outcome is not Outcome.NO_SOLUTION
 
 
-def cuopt_available() -> bool:
-    """True if PuLP can actually run cuOpt here. Importing pulp.CUOPT is not enough."""
+@dataclass(frozen=True)
+class _Raw:
+    values: FloatArray | None
+    proven: bool
+    """The solver proved this solution optimal (within the requested gap)."""
+    status: str
+
+
+def _gap_closed(objective: float, bound: float, gap_rel: float | None) -> bool:
+    """True if the solver's own bound backs up an optimality claim (minimisation).
+
+    An infinite bound means no search ran (presolve solved the problem outright), so there
+    is nothing to contradict the claim.
+    """
+    if not math.isfinite(bound):
+        return True
+    allowed = max(_ABS_GAP, (gap_rel or 0.0) * abs(objective))
+    return objective - bound <= allowed + 1e-6
+
+
+@contextlib.contextmanager
+def _quiet_stdout() -> Iterator[None]:
+    """Silence C-level stdout: HiGHS prints a banner and cuOpt echoes every setting, even
+    with logging off. Python's own prints in the block are lost too, so keep it narrow."""
+    sys.stdout.flush()
+    saved = os.dup(1)
     try:
-        return bool(pulp.CUOPT(msg=False).available())
+        with open(os.devnull, "w") as devnull:
+            os.dup2(devnull.fileno(), 1)
+        yield
+    finally:
+        os.dup2(saved, 1)
+        os.close(saved)
+
+
+def _solve_highs(model: ScheduleModel, time_limit: float, gap_rel: float | None) -> _Raw:
+    with _quiet_stdout():
+        h = highspy.Highs()
+    h.setOptionValue("output_flag", False)
+    h.setOptionValue("time_limit", float(time_limit))
+    h.setOptionValue("mip_rel_gap", float(gap_rel or 0.0))
+    h.setOptionValue("mip_abs_gap", _ABS_GAP)
+
+    lp = highspy.HighsLp()
+    lp.num_col_, lp.num_row_ = model.num_cols, model.num_rows
+    lp.col_cost_ = model.cost
+    lp.col_lower_, lp.col_upper_ = model.col_lower, model.col_upper
+    lp.row_lower_, lp.row_upper_ = model.row_lower, model.row_upper
+    lp.a_matrix_.format_ = highspy.MatrixFormat.kRowwise
+    lp.a_matrix_.start_ = model.offsets
+    lp.a_matrix_.index_ = model.indices
+    lp.a_matrix_.value_ = model.values
+    lp.integrality_ = [
+        highspy.HighsVarType.kInteger if i else highspy.HighsVarType.kContinuous
+        for i in model.integer
+    ]
+    h.passModel(lp)
+    h.run()
+
+    status = h.getModelStatus()
+    info = h.getInfo()
+    has_solution = info.primal_solution_status == highspy.SolutionStatus.kSolutionStatusFeasible
+    claimed = status == highspy.HighsModelStatus.kOptimal
+    return _Raw(
+        values=np.asarray(h.getSolution().col_value) if has_solution else None,
+        proven=claimed and _gap_closed(info.objective_function_value, info.mip_dual_bound, gap_rel),
+        status=h.modelStatusToString(status),
+    )
+
+
+def _solve_cuopt(model: ScheduleModel, time_limit: float, gap_rel: float | None) -> _Raw:
+    from cuopt.linear_programming import (  # pyright: ignore[reportMissingImports]
+        data_model,
+        solver,
+        solver_settings,
+    )
+    from cuopt.linear_programming.solver.solver_wrapper import (  # pyright: ignore[reportMissingImports]
+        ErrorStatus,
+        MILPTerminationStatus,
+    )
+
+    dm = data_model.DataModel()
+    dm.set_csr_constraint_matrix(model.values, model.indices, model.offsets)
+    dm.set_constraint_lower_bounds(model.row_lower)
+    dm.set_constraint_upper_bounds(model.row_upper)
+    dm.set_objective_coefficients(model.cost)
+    dm.set_variable_lower_bounds(model.col_lower)
+    dm.set_variable_upper_bounds(model.col_upper)
+    dm.set_variable_types(np.where(model.integer, "I", "C"))
+
+    with _quiet_stdout():
+        settings = solver_settings.SolverSettings()
+        settings.set_parameter("log_to_console", False)
+        settings.set_parameter("time_limit", float(time_limit))
+        settings.set_parameter("mip_relative_gap", float(gap_rel or 0.0))
+        settings.set_parameter("mip_absolute_gap", _ABS_GAP)
+        solution = solver.Solve(dm, settings)
+    if solution.get_error_status() != ErrorStatus.Success:
+        raise RuntimeError(solution.get_error_message())
+    status = MILPTerminationStatus(solution.get_termination_status())
+    values = np.asarray(solution.get_primal_solution(), dtype=np.float64)
+    objective = solution.get_primal_objective()
+    bound = solution.get_milp_stats()["solution_bound"]
+    # cuOpt 25.10 sometimes reports Optimal at the time limit while its own gap is ~100%
+    # (seen with a solution callback attached). Only trust the claim if the bound agrees.
+    proven = status == MILPTerminationStatus.Optimal and _gap_closed(objective, bound, gap_rel)
+    name = status.name
+    if status == MILPTerminationStatus.Optimal and not proven:
+        name += f" (unproven: objective {objective:g}, bound {bound:g})"
+    return _Raw(values=values if len(values) else None, proven=proven, status=name)
+
+
+@functools.cache
+def cuopt_available() -> bool:
+    """True if cuOpt can actually solve here: installed, with a usable GPU and driver.
+
+    Solves a one-variable problem once, which also pays CUDA's start-up cost up front.
+    """
+    tiny = ScheduleModel(
+        x_keys=(),
+        gap_keys=(),
+        cost=np.ones(1),
+        col_lower=np.zeros(1),
+        col_upper=np.ones(1),
+        integer=np.ones(1, dtype=np.bool_),
+        row_lower=np.ones(1),
+        row_upper=np.full(1, np.inf),
+        offsets=np.array([0, 1], np.int32),
+        indices=np.zeros(1, np.int32),
+        values=np.ones(1),
+    )
+    try:
+        return _solve_cuopt(tiny, time_limit=10, gap_rel=None).values is not None
     except Exception:
         return False
 
 
-class _CUOPT(pulp.CUOPT):
-    """pulp.CUOPT that passes cuOpt parameters through.
+def classify(model: ScheduleModel, values: FloatArray | None, proven: bool) -> Outcome:
+    """Classify a solver's answer by checking it ourselves rather than trusting status codes.
 
-    PuLP 3.3's adapter drops every extra parameter except `optimality_tolerance`, and maps
-    `gapRel` to cuOpt's LP-only `relative_gap_tolerance`, so a MIP gap never reaches cuOpt.
-    Only `callSolver` is replaced; revisit when moving to PuLP 4.
+    A result is usable only if every column has an integral, in-bounds value and every row
+    holds; it is optimal only if the solver also proved it.
     """
-
-    def __init__(
-        self, cuopt_params: Mapping[str, object], *, msg: bool, timeLimit: float | None
-    ) -> None:
-        super().__init__(msg=msg, timeLimit=timeLimit)
-        self.cuopt_params = dict(cuopt_params)
-
-    def callSolver(self, lp: pulp.LpProblem, callback: object = None) -> object:
-        from cuopt.linear_programming import solver, solver_settings  # pyright: ignore[reportMissingImports]
-
-        settings = solver_settings.SolverSettings()
-        settings.set_parameter("infeasibility_detection", True)
-        settings.set_parameter("log_to_console", self.msg)
-        if self.timeLimit:
-            settings.set_parameter("time_limit", self.timeLimit)
-        for key, value in self.cuopt_params.items():
-            settings.set_parameter(key, value)
-        start = time.perf_counter()
-        solution = solver.Solve(lp.solverModel, settings)  # pyright: ignore[reportAttributeAccessIssue]
-        self.solveTime = time.perf_counter() - start
-        return solution
-
-
-def _solver(backend: Backend, time_limit: float, gap_rel: float | None) -> pulp.LpSolver:
-    if backend is Backend.GPU:
-        params = {} if gap_rel is None else {"mip_relative_gap": gap_rel}
-        return _CUOPT(params, msg=False, timeLimit=time_limit)
-    # PuLP 3.x re-exports via `import *` and a Rust core, which pyright cannot follow.
-    return pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit, gapRel=gap_rel)  # pyright: ignore[reportAttributeAccessIssue]
-
-
-def classify(lp: pulp.LpProblem, tol: float = 1e-6) -> Outcome:
-    """Classify a solved model without trusting solver-specific status codes.
-
-    CBC reports a time-limited run with a solution as "Optimal" (only `sol_status` says it
-    isn't proven), and PuLP's cuOpt adapter reports it as "Not Solved" while still loading
-    the values. So: a result is usable if every variable has an integral value and every
-    constraint holds; it is optimal only if the solver also proved optimality.
-    """
-    for v in lp.variables():
-        value = v.varValue
-        if value is None:
-            return Outcome.NO_SOLUTION
-        if v.cat == pulp.LpInteger and abs(value - round(value)) > tol:
-            return Outcome.NO_SOLUTION
-    # PuLP annotates eps as int, but it is compared against float slacks.
-    if not lp.valid(tol):  # pyright: ignore[reportArgumentType]
+    if values is None or not model.is_feasible(values):
         return Outcome.NO_SOLUTION
-    proven = lp.status == pulp.LpStatusOptimal and lp.sol_status == pulp.LpSolutionOptimal  # pyright: ignore[reportAttributeAccessIssue]
     return Outcome.OPTIMAL if proven else Outcome.FEASIBLE
+
+
+_SOLVERS = {Backend.CPU: _solve_highs, Backend.GPU: _solve_cuopt}
 
 
 def solve(
@@ -119,9 +219,11 @@ def solve(
     gap_rel: float | None = None,
 ) -> SolveResult:
     """Solve `problem`. `gap_rel` lets the solver stop once it is provably within that
-    fraction of the best possible objective (None = solver default); the result then
+    fraction of the best possible objective (None = prove optimal); the result then
     counts as optimal."""
+    start = time.perf_counter()
     model = build_model(problem)
+    build_seconds = time.perf_counter() - start
     warnings: list[str] = []
 
     if backend is Backend.GPU and not cuopt_available():
@@ -130,34 +232,37 @@ def solve(
 
     start = time.perf_counter()
     try:
-        model.lp.solve(_solver(backend, time_limit, gap_rel))
+        raw = _SOLVERS[backend](model, time_limit, gap_rel)
     except Exception as exc:
         if backend is Backend.CPU:
             raise
         warnings.append(f"cuOpt failed ({exc}); solved on CPU instead.")
         backend = Backend.CPU
         start = time.perf_counter()
-        model.lp.solve(_solver(backend, time_limit, gap_rel))
+        raw = _SOLVERS[backend](model, time_limit, gap_rel)
     elapsed = time.perf_counter() - start
 
-    outcome = classify(model.lp)
+    outcome = classify(model, raw.values, raw.proven)
     assignments: tuple[Assignment, ...] = ()
     objective = None
     if outcome is not Outcome.NO_SOLUTION:
+        assert raw.values is not None
+        chosen = np.flatnonzero(raw.values[: len(model.x_keys)] > 0.5)
         assignments = tuple(
             sorted(
                 Assignment(day=d, shift=s, employee_id=emp)
-                for (emp, s, d), var in model.x.items()
-                if (var.varValue or 0) > 0.5
+                for emp, s, d in (model.x_keys[i] for i in chosen)
             )
         )
-        objective = model.lp.objective.value() if model.lp.objective else None
+        # Recomputed from the rounded solution, so both backends report it the same way.
+        objective = float(model.cost @ np.round(raw.values, 6))
     return SolveResult(
         outcome=outcome,
-        solver_status=pulp.LpStatus[model.lp.status],  # pyright: ignore[reportAttributeAccessIssue]
+        solver_status=raw.status,
         backend=backend,
         solve_seconds=elapsed,
         objective=objective,
         assignments=assignments,
         warnings=tuple(warnings),
+        build_seconds=build_seconds,
     )
