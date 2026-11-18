@@ -245,3 +245,12 @@ def test_gpu_failure_falls_back_to_cpu(
     result = solve(small_feasible, Backend.GPU)
     assert result.backend is Backend.CPU and result.outcome is Outcome.OPTIMAL
     assert result.warnings == ("cuOpt failed (boom); solved on CPU instead.",)
+
+
+@pytest.mark.parametrize("backend", [Backend.CPU, pytest.param(Backend.GPU, marks=pytest.mark.gpu)])
+def test_incumbent_trace_ends_at_the_result(backend: Backend) -> None:
+    result = solve(generate_problem(45, 14, seed=1), backend)
+    assert result.incumbents, "no incumbent was reported"
+    times = [t for t, _ in result.incumbents]
+    assert times == sorted(times) and times[-1] <= result.solve_seconds
+    assert result.incumbents[-1][1] == pytest.approx(result.objective)

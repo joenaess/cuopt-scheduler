@@ -55,6 +55,8 @@ class SolveResult:
     warnings: tuple[str, ...] = ()
     build_seconds: float = 0.0
     """Time to build the model arrays (shared by both backends)."""
+    incumbents: tuple[tuple[float, float], ...] = ()
+    """(seconds into the solve, objective) each time the solver found a better schedule."""
 
     @property
     def feasible(self) -> bool:
@@ -67,6 +69,7 @@ class _Raw:
     proven: bool
     """The solver proved this solution optimal (within the requested gap)."""
     status: str
+    incumbents: tuple[tuple[float, float], ...] = ()
 
 
 def _gap_closed(objective: float, bound: float, gap_rel: float | None) -> bool:
@@ -97,6 +100,8 @@ def _quiet_stdout() -> Iterator[None]:
 
 
 def _solve_highs(model: ScheduleModel, time_limit: float, gap_rel: float | None) -> _Raw:
+    start = time.perf_counter()
+    trace: list[tuple[float, float]] = []
     with _quiet_stdout():
         h = highspy.Highs()
     h.setOptionValue("output_flag", False)
@@ -118,6 +123,9 @@ def _solve_highs(model: ScheduleModel, time_limit: float, gap_rel: float | None)
         for i in model.integer
     ]
     h.passModel(lp)
+    h.cbMipImprovingSolution.subscribe(
+        lambda e: trace.append((time.perf_counter() - start, e.data_out.objective_function_value))
+    )
     h.run()
 
     status = h.getModelStatus()
@@ -128,6 +136,7 @@ def _solve_highs(model: ScheduleModel, time_limit: float, gap_rel: float | None)
         values=np.asarray(h.getSolution().col_value) if has_solution else None,
         proven=claimed and _gap_closed(info.objective_function_value, info.mip_dual_bound, gap_rel),
         status=h.modelStatusToString(status),
+        incumbents=tuple(trace),
     )
 
 
@@ -137,10 +146,21 @@ def _solve_cuopt(model: ScheduleModel, time_limit: float, gap_rel: float | None)
         solver,
         solver_settings,
     )
+    from cuopt.linear_programming.internals import (  # pyright: ignore[reportMissingImports]
+        GetSolutionCallback,
+    )
     from cuopt.linear_programming.solver.solver_wrapper import (  # pyright: ignore[reportMissingImports]
         ErrorStatus,
         MILPTerminationStatus,
     )
+
+    start = time.perf_counter()
+    trace: list[tuple[float, float]] = []
+
+    class Trace(GetSolutionCallback):  # pyright: ignore[reportUntypedBaseClass]
+        def get_solution(self, solution: object, solution_cost: object) -> None:
+            cost = solution_cost.copy_to_host()[0]  # pyright: ignore[reportAttributeAccessIssue]
+            trace.append((time.perf_counter() - start, float(cost)))
 
     dm = data_model.DataModel()
     dm.set_csr_constraint_matrix(model.values, model.indices, model.offsets)
@@ -157,6 +177,8 @@ def _solve_cuopt(model: ScheduleModel, time_limit: float, gap_rel: float | None)
         settings.set_parameter("time_limit", float(time_limit))
         settings.set_parameter("mip_relative_gap", float(gap_rel or 0.0))
         settings.set_parameter("mip_absolute_gap", _ABS_GAP)
+        callback = Trace()
+        settings.set_mip_callback(callback)
         solution = solver.Solve(dm, settings)
     if solution.get_error_status() != ErrorStatus.Success:
         raise RuntimeError(solution.get_error_message())
@@ -170,7 +192,12 @@ def _solve_cuopt(model: ScheduleModel, time_limit: float, gap_rel: float | None)
     name = status.name
     if status == MILPTerminationStatus.Optimal and not proven:
         name += f" (unproven: objective {objective:g}, bound {bound:g})"
-    return _Raw(values=values if len(values) else None, proven=proven, status=name)
+    return _Raw(
+        values=values if len(values) else None,
+        proven=proven,
+        status=name,
+        incumbents=tuple(trace),
+    )
 
 
 @functools.cache
@@ -265,4 +292,5 @@ def solve(
         assignments=assignments,
         warnings=tuple(warnings),
         build_seconds=build_seconds,
+        incumbents=raw.incumbents,
     )
