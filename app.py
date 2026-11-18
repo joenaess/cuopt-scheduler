@@ -2,6 +2,7 @@
 
 import dataclasses
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -15,8 +16,17 @@ from cuopt_scheduler import (
     solve,
 )
 from cuopt_scheduler.data import LEVELS
+from cuopt_scheduler.explain import (
+    Explanation,
+    cost_breakdown,
+    decision_grid,
+    explain,
+    is_proven,
+    schedule_vector,
+)
 from cuopt_scheduler.frames import demand_frame, employees_frame, gaps_frame, schedule_frame
-from cuopt_scheduler.viz import coverage_figure, gantt_figure
+from cuopt_scheduler.lp_round import LPEngine
+from cuopt_scheduler.viz import coverage_figure, decision_grid_figure, gantt_figure
 
 st.set_page_config(page_title="NVIDIA cuOpt Scheduler", layout="wide")
 st.title("🏥 Intelligent Staff Scheduler")
@@ -89,8 +99,10 @@ with st.sidebar:
         for backend in backends:
             with st.spinner(f"Optimizing schedule on {backend.upper()}..."):
                 results.append(solve(problem, backend, time_limit=time_limit, gap_rel=gap))
+        with st.spinner("Preparing the explanation (LP relaxation)..."):
+            explanation = explain(problem, primary)
         # Keep results across reruns (e.g. clicking the download button).
-        st.session_state["run"] = (problem, results)
+        st.session_state["run"] = (problem, results, explanation)
 
 run = st.session_state.get("run")
 if run is None:
@@ -106,7 +118,7 @@ if run is None:
         st.dataframe(demand_frame(preview))
     st.stop()
 
-problem, results = run
+problem, results, explanation = run
 result = results[0]
 
 
@@ -156,8 +168,13 @@ if gaps:
     )
 
 schedule = schedule_frame(problem, result.assignments)
-tab1, tab2, tab3 = st.tabs(
-    ["📅 Visual Schedule (Gantt)", "📊 Coverage Analysis", "📝 Detailed List"]
+tab1, tab2, tab3, tab4 = st.tabs(
+    [
+        "📅 Visual Schedule (Gantt)",
+        "📊 Coverage Analysis",
+        "📝 Detailed List",
+        "🎓 How it was solved",
+    ]
 )
 
 with tab1:
@@ -185,3 +202,136 @@ with tab3:
     st.download_button(
         "Download Schedule CSV", export.to_csv(index=False), "optimized_schedule.csv", "text/csv"
     )
+
+
+def how_it_was_solved(result: SolveResult, ex: Explanation) -> None:
+    model = ex.model
+    st.markdown(
+        "This schedule was found by solving a **mixed-integer linear program (MILP)**: "
+        "a list of yes/no **decisions**, **rules** they must obey, and a **cost** to make "
+        "as small as possible. Here is each part, for the problem you just solved."
+    )
+
+    st.subheader("1 · Decisions")
+    st.markdown(
+        "Each cell is one decision: *does this person work this shift on this day?* "
+        "**1 = yes**, **0 = no**. ✕ marks shifts the person can't work, so that decision is "
+        "fixed to no."
+    )
+    c = st.columns(3)
+    c[0].metric("Yes/no decisions", f"{ex.num_decisions:,}")
+    c[1].metric("Fixed to no (unavailable)", f"{ex.num_fixed:,}")
+    c[2].metric(
+        "Shortfall counters",
+        f"{model.num_cols - ex.num_decisions:,}",
+        help=(
+            "One per day, shift and skill: how many required staff are missing. "
+            "They let the model say 'not enough staff' instead of having no answer."
+        ),
+    )
+    values = schedule_vector(model, result.assignments)
+    grid = decision_grid(problem, model, values)
+    days = len(grid.columns.get_level_values("Day").unique())
+    shown = (
+        f"first {len(grid)} of {len(problem.employees)} people, "
+        f"first {days} of {problem.num_days} days"
+    )
+    st.plotly_chart(
+        decision_grid_figure(
+            grid, f"The schedule as decisions ({shown}; D/E/N = Day/Evening/Night)"
+        ),
+        width="stretch",
+    )
+
+    st.subheader("2 · Rules")
+    st.markdown(
+        "Every rule becomes a set of **linear constraints**: sums of decisions that must "
+        "stay within a limit. For example, *at most one shift per person per day* is "
+        "one constraint per person per day: Day + Evening + Night ≤ 1."
+    )
+    rules = pd.DataFrame(model.rules, columns=pd.Index(["Rule", "Constraints"]))
+    st.dataframe(rules, hide_index=True, width="stretch")
+    st.caption(f"{ex.num_constraints:,} constraints in total.")
+
+    st.subheader("3 · Cost")
+    st.markdown(
+        "The solver minimises one number. A missing staff member costs far more than a "
+        "shift worked, so covering demand always comes first; then it uses as few (and as "
+        "few disliked) shifts as it can."
+    )
+    breakdown = cost_breakdown(model, values)
+    st.dataframe(breakdown, hide_index=True, width="stretch")
+    objective = float(model.cost @ values)  # = the sum of the parts above
+    st.caption(f"Total cost: **{objective:,.0f}**")
+
+    st.subheader("4 · The shortcut: relax, round, prove")
+    on_gpu = ex.engine is LPEngine.CUOPT_PDLP
+    st.markdown(
+        "Searching every combination of yes/no answers is hopeless "
+        f"(2^{ex.num_decisions - ex.num_fixed:,} of them). Instead, first **relax** the "
+        "problem: allow fractions, like *half a shift*. That is a plain linear program (LP), "
+        + (
+            "which the GPU solves fast with cuOpt's PDLP (a first-order method built for GPUs)."
+            if on_gpu
+            else "which the CPU solves with HiGHS's simplex method."
+        )
+    )
+    if ex.share_already_whole >= 0.9:
+        st.markdown("Here the LP's answer is already almost all 0s and 1s.")
+    else:
+        st.markdown(
+            "Here the LP's answer is full of fractions. Many people are interchangeable "
+            "(same skill, free that day), so the LP splits a shift between them, like "
+            "0.33 each for three equally good choices. That's fine: what matters is that "
+            "its cost is as low as any real schedule's can be, and rounding picks one of "
+            "the equally good options."
+        )
+    c = st.columns(3)
+    c[0].metric("LP solved in", f"{ex.lp_seconds:.2f} s", help=f"Engine: {ex.engine}")
+    c[1].metric("LP decisions already 0 or 1", f"{ex.share_already_whole:.0%}")
+    changed = int(np.sum(np.abs(ex.rounded - ex.lp)[: ex.num_decisions] > 1e-3))
+    c[2].metric("Decisions rounding changed", f"{changed:,}")
+    st.plotly_chart(
+        decision_grid_figure(
+            decision_grid(problem, model, ex.lp), "Relaxed (LP): fractions allowed"
+        ),
+        width="stretch",
+    )
+    st.plotly_chart(
+        decision_grid_figure(
+            decision_grid(problem, model, ex.rounded), "Rounded: a valid schedule"
+        ),
+        width="stretch",
+    )
+    st.markdown(
+        "**Rounding** turns the fractions into yes/no, filling each shift with the people "
+        "the LP liked most, and never adds anyone a rule doesn't allow. The result is always "
+        "a valid schedule."
+    )
+
+    st.markdown(
+        "**Proving it is the best.** The LP also gives a *lower bound*: no schedule, "
+        "however clever, can cost less. If our schedule's cost is within 1 of it (costs "
+        "are whole numbers), nothing cheaper exists."
+    )
+    c = st.columns(3)
+    c[0].metric("This schedule costs", f"{objective:,.0f}")
+    c[1].metric("No schedule can cost less than", f"{ex.bound:,.2f}")
+    c[2].metric("Gap", f"{objective - ex.bound:,.2f}")
+    if is_proven(objective, ex.bound):
+        st.success("Gap below 1: the LP bound proves this schedule optimal. No search needed.")
+    elif result.outcome is Outcome.OPTIMAL:
+        st.info(
+            "The LP bound alone leaves a gap here, so the MILP solver closed it by "
+            "**search** (branch and bound: trying yes and no for undecided cells and "
+            "discarding branches that can't beat the best schedule found)."
+        )
+    else:
+        st.warning(
+            "Not proven: the solver stopped at the time limit with this gap. A cheaper "
+            "schedule may exist, but it can't be cheaper than the bound."
+        )
+
+
+with tab4:
+    how_it_was_solved(result, explanation)

@@ -18,9 +18,12 @@ This project solves a nurse rostering problem as a mixed-integer program, on a l
 
     * **Heatmaps:** Instant analysis of shift coverage and gaps.
 
+* **How it was solved:** A teaching tab that walks through the MILP for the problem you just solved: the yes/no decisions as a grid, each rule and how many constraints it creates, the cost broken into its parts, the LP relaxation next to its rounded schedule, and the lower bound that proves no schedule is cheaper (or the gap the solver's search had to close).
 * **Constraint Handling:** Skill requirements, weekly hour caps, availability, one shift per day and a minimum rest between shifts (default 11h).
 * **Never just "Infeasible":** When there aren't enough staff, the app still produces the best schedule and lists exactly which shifts are short.
 * **Export:** Download optimized schedules as CSV files.
+
+<img alt="The How it was solved tab: the LP relaxation solved on the GPU in 0.03 s, shown as a grid of employees by day and shift with fractional values such as 0.23 and 0.33, because interchangeable staff share shifts in the relaxation. Crosses mark shifts a person can't work." src="docs/img/explain-tab.png" width="720">
 
 ## 🛠️ Prerequisites
 
@@ -168,6 +171,7 @@ cuopt-scheduler/
 │   ├── lp_round.py           # LP relaxation + rounding; warm start for cuOpt's MILP solver
 │   ├── validate.py           # Independent schedule checker
 │   ├── frames.py             # DataFrames for display and CSV export
+│   ├── explain.py            # Numbers for the app's "How it was solved" tab
 │   ├── viz.py                # Plotly figures
 │   ├── benchmark.py          # CPU vs GPU benchmark (`cuopt-bench`)
 │   └── plots.py              # README charts and results table (`cuopt-plots`)

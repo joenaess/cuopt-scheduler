@@ -39,6 +39,8 @@ class ScheduleModel:
     """CSR: row i's entries are indices/values[offsets[i]:offsets[i + 1]]."""
     indices: IntArray
     values: FloatArray
+    rules: tuple[tuple[str, int], ...] = ()
+    """(rule in plain words, number of rows it adds), in row order."""
 
     @property
     def num_cols(self) -> int:
@@ -125,6 +127,14 @@ def build_model(problem: Problem) -> ScheduleModel:
     blocks: list[_Block] = []
 
     # 1. Staffing demand per day, shift and skill: staff + uncovered >= need.
+    rules: list[tuple[str, int]] = []
+
+    def rule(label: str, start: int) -> None:
+        """Record that the blocks from `start` on implement `label`."""
+        rows = sum(len(b.cols) for b in blocks[start:])
+        if rows:
+            rules.append((label, rows))
+
     gap_keys: list[GapKey] = []
     gap_upper: list[float] = []
     for si, s in enumerate(shifts):
@@ -134,37 +144,48 @@ def build_model(problem: Problem) -> ScheduleModel:
             blocks.append(_Block(np.hstack([x[who, si, :].T, gap]), float(need), np.inf))
             gap_keys += [(d, s, skill) for d in days]
             gap_upper += [float(need)] * n_day
+    rule("Each shift gets the staff it needs per skill (or the shortfall is counted)", 0)
 
     # 2. Max hours per calendar week, as a shift count (all shifts have the same length).
     max_shifts = np.array(
         [e.max_weekly_hours // problem.shift_length for e in employees], np.float64
     )
+    start = len(blocks)
     blocks.extend(
         _Block(x[:, :, week.start : week.stop].reshape(n_emp, -1), -np.inf, max_shifts)
         for week in problem.weeks
     )
+    rule("No one works more than their contracted hours per week", start)
 
     # 3. At most one shift per day.
+    start = len(blocks)
     blocks.append(_Block(x.transpose(0, 2, 1).reshape(-1, n_shift), -np.inf, 1.0))
+    rule("At most one shift per person per day", start)
 
     # 4. Most days in a row: any window of k + 1 days has at most k working days.
     if (k := problem.max_consecutive_days) is not None:
-        for start in range(n_day - k):
-            window = x[:, :, start : start + k + 1].reshape(n_emp, -1)
+        start = len(blocks)
+        for first in range(n_day - k):
+            window = x[:, :, first : first + k + 1].reshape(n_emp, -1)
             blocks.append(_Block(window, -np.inf, float(k)))
+        rule(f"At most {k} working days in a row", start)
 
     # 5. Per-shift weekly caps (e.g. nights).
     for s, cap in problem.weekly_shift_caps.items():
         si = shifts.index(s)
+        start = len(blocks)
         blocks.extend(
             _Block(x[:, si, week.start : week.stop], -np.inf, float(cap)) for week in problem.weeks
         )
+        rule(f"At most {cap} {s.lower()} shifts per person per week", start)
 
     # 6. Minimum rest between consecutive days' shifts.
+    start = len(blocks)
     for today, tomorrow in rest_conflicts(problem):
         t, m = shifts.index(today), shifts.index(tomorrow)
         pairs = np.stack([x[:, t, :-1], x[:, m, 1:]], axis=-1).reshape(-1, 2)
         blocks.append(_Block(pairs, -np.inf, 1.0))
+    rule(f"At least {problem.min_rest_hours} h rest between shifts", start)
 
     n_cols = n_x + len(gap_keys)
     col_upper = np.concatenate([np.ones(n_x), np.array(gap_upper)])
@@ -195,4 +216,5 @@ def build_model(problem: Problem) -> ScheduleModel:
         offsets=np.concatenate([[0], np.cumsum(lengths)]).astype(np.int32),
         indices=np.concatenate([b.cols.ravel() for b in blocks]).astype(np.int32),
         values=np.ones(int(lengths.sum())),
+        rules=tuple(rules),
     )
