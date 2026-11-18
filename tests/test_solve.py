@@ -1,8 +1,8 @@
-from dataclasses import dataclass, replace
+from dataclasses import replace
 
 import numpy as np
 import pytest
-from hypothesis import HealthCheck, given, settings
+from hypothesis import HealthCheck, event, given, settings
 from hypothesis import strategies as st
 
 from cuopt_scheduler import (
@@ -10,28 +10,18 @@ from cuopt_scheduler import (
     Backend,
     Outcome,
     Problem,
-    SolveResult,
     coverage_gaps,
     generate_problem,
+    schedule_cost,
     solve,
     violations,
 )
 from cuopt_scheduler import solver as solver_module
-from cuopt_scheduler.model import UNCOVERED_PENALTY, ScheduleModel, build_model, rest_conflicts
+from cuopt_scheduler.data import LEVELS
+from cuopt_scheduler.model import ScheduleModel, build_model, rest_conflicts
 from cuopt_scheduler.solver import _gap_closed, classify
 
 from .conftest import SMALL_DEMAND, rn
-
-
-@dataclass(frozen=True)
-class SolveResultStub:
-    assignments: tuple[Assignment, ...]
-
-
-def expected_objective(problem: Problem, result: SolveResult | SolveResultStub) -> float:
-    """Objective recomputed from the schedule via the independent validator."""
-    gaps = coverage_gaps(problem, result.assignments)
-    return UNCOVERED_PENALTY * sum(gaps.values()) + len(result.assignments)
 
 
 def test_build_model_size(small_feasible: Problem) -> None:
@@ -70,7 +60,7 @@ def test_understaffed_reports_gaps_instead_of_failing(understaffed: Problem) -> 
     assert result.outcome is Outcome.OPTIMAL
     assert violations(understaffed, result.assignments) == []
     assert coverage_gaps(understaffed, result.assignments) == {(1, "Night", "RN"): 1}
-    assert result.objective == expected_objective(understaffed, result)
+    assert result.objective == schedule_cost(understaffed, result.assignments)
 
 
 def test_rest_rule_changes_the_schedule() -> None:
@@ -92,7 +82,8 @@ def test_hour_cap_resets_each_week() -> None:
     off = {(d, "Day") for d in range(1, 7)}
     p = Problem(employees=(rn("A", 8, unavailable=off),), num_days=8, demand={"Day": {"RN": 1}})
     result = solve(p)
-    assert result.assignments and {a.day for a in result.assignments} == {0, 7}
+    assert result.assignments
+    assert {a.day for a in result.assignments} == {0, 7}
     assert violations(p, result.assignments) == []
 
 
@@ -174,36 +165,57 @@ def test_gap_closed(objective: float, bound: float, gap_rel: float | None, close
     num_days=st.integers(1, 15),
     min_rest=st.integers(0, 16),
     seed=st.integers(0, 2**32 - 1),
+    level=st.sampled_from(sorted(LEVELS)),
 )
 def test_every_schedule_obeys_the_rules(
-    num_employees: int, num_days: int, min_rest: int, seed: int
+    num_employees: int, num_days: int, min_rest: int, seed: int, level: int
 ) -> None:
-    problem = replace(generate_problem(num_employees, num_days, seed=seed), min_rest_hours=min_rest)
+    problem = replace(
+        generate_problem(num_employees, num_days, seed=seed, level=level), min_rest_hours=min_rest
+    )
     result = solve(problem)
     assert result.outcome is Outcome.OPTIMAL
     assert violations(problem, result.assignments) == []
     # The model's view of uncovered demand matches the validator's.
-    assert result.objective == pytest.approx(expected_objective(problem, result))
+    assert result.objective == pytest.approx(schedule_cost(problem, result.assignments))
 
 
-@settings(max_examples=50, deadline=None)
+# Substrings of the validator's messages, one per rule, for Hypothesis' statistics.
+RULES = ("h in week", "shifts on day", "in a row", "shifts in week", "rests", "unavailable")
+
+
+@settings(max_examples=100, deadline=None)
 @given(
     num_employees=st.integers(3, 12),
-    num_days=st.integers(1, 9),
+    num_days=st.integers(1, 15),
     min_rest=st.integers(0, 16),
     seed=st.integers(0, 2**32 - 1),
+    level=st.sampled_from(sorted(LEVELS)),
     data=st.data(),
 )
 def test_model_agrees_with_validator(
-    num_employees: int, num_days: int, min_rest: int, seed: int, data: st.DataObject
+    num_employees: int, num_days: int, min_rest: int, seed: int, level: int, data: st.DataObject
 ) -> None:
     """Any schedule satisfies the model's rows exactly when the validator accepts it.
 
     Ties the array encoding to the independent rule checker, without involving a solver.
     """
-    problem = replace(generate_problem(num_employees, num_days, seed=seed), min_rest_hours=min_rest)
+    problem = replace(
+        generate_problem(num_employees, num_days, seed=seed, level=level), min_rest_hours=min_rest
+    )
     model = build_model(problem)
-    picked = data.draw(st.sets(st.sampled_from(range(len(model.x_keys))), max_size=40))
+    # Concentrate on a few people, so per-person rules (weekly caps, days in a row, rest)
+    # actually get broken in some examples.
+    per_person = len(model.x_keys) // num_employees
+    who = data.draw(st.sets(st.integers(0, num_employees - 1), min_size=1, max_size=3))
+    columns = [i * per_person + j for i in sorted(who) for j in range(per_person)]
+    picked = data.draw(st.sets(st.sampled_from(columns), max_size=3 * num_days))
+    if data.draw(st.booleans()):
+        # A run of the same shift on consecutive days, which random picks rarely produce.
+        i, si = min(who), data.draw(st.integers(0, len(problem.shifts) - 1))
+        start, length = data.draw(st.integers(0, num_days - 1)), data.draw(st.integers(2, 8))
+        days = range(start, min(num_days, start + length))
+        picked |= {i * per_person + si * num_days + d for d in days}
     schedule = [
         Assignment(day=d, shift=s, employee_id=e) for e, s, d in (model.x_keys[i] for i in picked)
     ]
@@ -211,15 +223,23 @@ def test_model_agrees_with_validator(
     v = np.zeros(model.num_cols)
     v[list(picked)] = 1
     v[len(model.x_keys) :] = [gaps.get(k, 0) for k in model.gap_keys]
-    assert model.is_feasible(v) == (violations(problem, schedule) == [])
-    assert model.cost @ v == expected_objective(problem, SolveResultStub(tuple(schedule)))
+    broken = violations(problem, schedule)
+    for rule in RULES:
+        if any(rule in message for message in broken):
+            event(f"breaks {rule!r}")
+    if not broken:
+        event("valid")
+    assert model.is_feasible(v) == (not broken)
+    assert model.cost @ v == schedule_cost(problem, schedule)
 
 
 @pytest.mark.gpu
+@pytest.mark.parametrize("warm_start", [True, False])
 @pytest.mark.parametrize("seed", [1, 2, 3])
-def test_gpu_matches_cpu(seed: int) -> None:
+def test_gpu_matches_cpu(seed: int, warm_start: bool) -> None:
     problem = generate_problem(45, 14, seed=seed)
-    cpu, gpu = solve(problem, Backend.CPU), solve(problem, Backend.GPU)
+    cpu = solve(problem, Backend.CPU)
+    gpu = solve(problem, Backend.GPU, warm_start=warm_start)
     assert gpu.backend is Backend.GPU, gpu.warnings
     assert cpu.outcome is gpu.outcome is Outcome.OPTIMAL
     assert gpu.objective == pytest.approx(cpu.objective)
@@ -234,16 +254,19 @@ def test_gpu_reports_its_own_backend(understaffed: Problem) -> None:
     assert coverage_gaps(understaffed, result.assignments) == {(1, "Night", "RN"): 1}
 
 
+@pytest.mark.parametrize("warm_start", [True, False])
 def test_gpu_failure_falls_back_to_cpu(
-    small_feasible: Problem, monkeypatch: pytest.MonkeyPatch
+    small_feasible: Problem, monkeypatch: pytest.MonkeyPatch, warm_start: bool
 ) -> None:
-    def broken(*args: object) -> None:
+    def broken(*args: object, **kwargs: object) -> None:
         raise RuntimeError("boom")
 
     monkeypatch.setattr("cuopt_scheduler.solver.cuopt_available", lambda: True)
-    monkeypatch.setitem(solver_module._SOLVERS, Backend.GPU, broken)
-    result = solve(small_feasible, Backend.GPU)
-    assert result.backend is Backend.CPU and result.outcome is Outcome.OPTIMAL
+    monkeypatch.setattr(solver_module, "_solve_cuopt", broken)
+    monkeypatch.setattr(solver_module, "_solve_cuopt_warm", broken)
+    result = solve(small_feasible, Backend.GPU, warm_start=warm_start)
+    assert result.backend is Backend.CPU
+    assert result.outcome is Outcome.OPTIMAL
     assert result.warnings == ("cuOpt failed (boom); solved on CPU instead.",)
 
 
@@ -252,5 +275,42 @@ def test_incumbent_trace_ends_at_the_result(backend: Backend) -> None:
     result = solve(generate_problem(45, 14, seed=1), backend)
     assert result.incumbents, "no incumbent was reported"
     times = [t for t, _ in result.incumbents]
-    assert times == sorted(times) and times[-1] <= result.solve_seconds
+    assert times == sorted(times)
+    assert times[-1] <= result.solve_seconds
     assert result.incumbents[-1][1] == pytest.approx(result.objective)
+
+
+def model_accepts(problem: Problem, schedule: list[Assignment]) -> bool:
+    model = build_model(problem)
+    v = np.zeros(model.num_cols)
+    v[[model.x_keys.index((a.employee_id, a.shift, a.day)) for a in schedule]] = 1
+    gaps = coverage_gaps(problem, schedule)
+    v[len(model.x_keys) :] = [gaps.get(k, 0) for k in model.gap_keys]
+    return model.is_feasible(v)
+
+
+@pytest.mark.parametrize(("days_in_a_row", "ok"), [(5, True), (6, False)])
+def test_model_limits_days_in_a_row(days_in_a_row: int, ok: bool) -> None:
+    p = Problem(
+        employees=(rn("A", 56),), num_days=7, demand={"Day": {"RN": 1}}, max_consecutive_days=5
+    )
+    assert model_accepts(p, [Assignment(d, "Day", "A") for d in range(days_in_a_row)]) is ok
+
+
+@pytest.mark.parametrize(("nights", "ok"), [(2, True), (3, False)])
+def test_model_caps_nights_per_week(nights: int, ok: bool) -> None:
+    p = Problem(
+        employees=(rn("A"),),
+        num_days=7,
+        demand={"Night": {"RN": 1}},
+        weekly_shift_caps={"Night": 2},
+    )
+    assert model_accepts(p, [Assignment(2 * i, "Night", "A") for i in range(nights)]) is ok
+
+
+def test_dislikes_raise_the_cost_and_are_avoided() -> None:
+    a = replace(rn("A"), dislikes=frozenset({(0, "Day")}))
+    p = Problem(employees=(a, rn("B")), num_days=1, demand={"Day": {"RN": 1}})
+    result = solve(p)
+    assert result.assignments == (Assignment(0, "Day", "B"),)
+    assert build_model(p).cost[build_model(p).x_keys.index(("A", "Day", 0))] == 2

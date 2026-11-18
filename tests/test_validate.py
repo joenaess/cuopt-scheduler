@@ -2,7 +2,14 @@
 
 from dataclasses import replace
 
-from cuopt_scheduler import Assignment, Employee, Problem, coverage_gaps, violations
+from cuopt_scheduler import (
+    Assignment,
+    Employee,
+    Problem,
+    coverage_gaps,
+    schedule_cost,
+    violations,
+)
 
 from .conftest import SMALL_DEMAND, rn
 
@@ -87,3 +94,27 @@ def test_detects_unknown_references() -> None:
         "unknown shift 'Brunch'",
         "day 5 outside horizon",
     ]
+
+
+def test_max_consecutive_days() -> None:
+    p = replace(problem(rn("A", 56), days=8, demand={"Day": {"RN": 1}}), max_consecutive_days=3)
+    three = [A(d, "Day", "A") for d in (0, 1, 2, 4, 5, 6)]
+    assert violations(p, three) == []
+    four = [A(d, "Day", "A") for d in (0, 1, 2, 3)]
+    assert violations(p, four) == ["A works more than 3 days in a row (to day 3)"]
+
+
+def test_weekly_shift_cap() -> None:
+    p = replace(
+        problem(rn("A"), days=7, demand={"Night": {"RN": 1}}), weekly_shift_caps={"Night": 2}
+    )
+    assert violations(p, [A(0, "Night", "A"), A(3, "Night", "A")]) == []
+    assert violations(p, [A(d, "Night", "A") for d in (0, 2, 4)]) == [
+        "A works 3 Night shifts in week 1, cap is 2"
+    ]
+
+
+def test_schedule_cost_counts_gaps_shifts_and_dislikes() -> None:
+    p = problem(replace(rn("A"), dislikes=frozenset({(0, "Night")})), rn("B"))
+    assert schedule_cost(p, [A(0, "Day", "A")]) == 1000 + 1  # Night uncovered
+    assert schedule_cost(p, [A(0, "Day", "B"), A(0, "Night", "A")]) == 2 + 1  # one disliked

@@ -11,9 +11,11 @@ import math
 import os
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
+from typing import Any
 
 import highspy
 import numpy as np
@@ -26,6 +28,17 @@ __all__ = ["Assignment", "Backend", "Outcome", "SolveResult", "cuopt_available",
 # Every cost is an integer, so a bound within less than 1 of the best schedule proves it
 # optimal. Both solvers get this, so neither keeps searching for a better score that can't exist.
 _ABS_GAP = 0.999
+
+CUOPT_MIP_PARAMS: dict[str, int | float] = {
+    # cuOpt 26.10's default presolve (Papilo plus its own) spent 59 of 60 s on a 40-ward
+    # problem without finishing; with it off, cuOpt proves the optimum in 8 s. This model
+    # has little for presolve to remove anyway.
+    "presolve": 0,
+    # Solve the root LP with PDLP rather than racing it against dual simplex ("concurrent"):
+    # on large instances the race was won by a 31 s dual simplex.
+    "method": 1,
+}
+"""Settings on top of cuOpt's defaults for MILP solves (see docs/benchmarks/README.md)."""
 
 
 class Backend(StrEnum):
@@ -64,7 +77,7 @@ class SolveResult:
 
 
 @dataclass(frozen=True)
-class _Raw:
+class RawSolution:
     values: FloatArray | None
     proven: bool
     """The solver proved this solution optimal (within the requested gap)."""
@@ -91,7 +104,7 @@ def _quiet_stdout() -> Iterator[None]:
     sys.stdout.flush()
     saved = os.dup(1)
     try:
-        with open(os.devnull, "w") as devnull:
+        with Path(os.devnull).open("w") as devnull:
             os.dup2(devnull.fileno(), 1)
         yield
     finally:
@@ -99,16 +112,12 @@ def _quiet_stdout() -> Iterator[None]:
         os.close(saved)
 
 
-def _solve_highs(model: ScheduleModel, time_limit: float, gap_rel: float | None) -> _Raw:
-    start = time.perf_counter()
-    trace: list[tuple[float, float]] = []
+def highs_model(model: ScheduleModel, time_limit: float, *, relax: bool = False) -> highspy.Highs:
+    """A quiet HiGHS instance holding `model` (as an LP if `relax`)."""
     with _quiet_stdout():
         h = highspy.Highs()
     h.setOptionValue("output_flag", False)
     h.setOptionValue("time_limit", float(time_limit))
-    h.setOptionValue("mip_rel_gap", float(gap_rel or 0.0))
-    h.setOptionValue("mip_abs_gap", _ABS_GAP)
-
     lp = highspy.HighsLp()
     lp.num_col_, lp.num_row_ = model.num_cols, model.num_rows
     lp.col_cost_ = model.cost
@@ -118,11 +127,36 @@ def _solve_highs(model: ScheduleModel, time_limit: float, gap_rel: float | None)
     lp.a_matrix_.start_ = model.offsets
     lp.a_matrix_.index_ = model.indices
     lp.a_matrix_.value_ = model.values
-    lp.integrality_ = [
-        highspy.HighsVarType.kInteger if i else highspy.HighsVarType.kContinuous
-        for i in model.integer
-    ]
+    if not relax:
+        lp.integrality_ = [
+            highspy.HighsVarType.kInteger if i else highspy.HighsVarType.kContinuous
+            for i in model.integer
+        ]
     h.passModel(lp)
+    return h
+
+
+def cuopt_data_model(model: ScheduleModel, *, relax: bool = False) -> Any:
+    """A cuOpt DataModel holding `model` (as an LP if `relax`)."""
+    from cuopt.linear_programming import data_model  # pyright: ignore[reportMissingImports]
+
+    dm = data_model.DataModel()
+    dm.set_csr_constraint_matrix(model.values, model.indices, model.offsets)
+    dm.set_constraint_lower_bounds(model.row_lower)
+    dm.set_constraint_upper_bounds(model.row_upper)
+    dm.set_objective_coefficients(model.cost)
+    dm.set_variable_lower_bounds(model.col_lower)
+    dm.set_variable_upper_bounds(model.col_upper)
+    dm.set_variable_types(np.where(model.integer & (not relax), "I", "C"))
+    return dm
+
+
+def _solve_highs(model: ScheduleModel, time_limit: float, gap_rel: float | None) -> RawSolution:
+    start = time.perf_counter()
+    trace: list[tuple[float, float]] = []
+    h = highs_model(model, time_limit)
+    h.setOptionValue("mip_rel_gap", float(gap_rel or 0.0))
+    h.setOptionValue("mip_abs_gap", _ABS_GAP)
     h.cbMipImprovingSolution.subscribe(
         lambda e: trace.append((time.perf_counter() - start, e.data_out.objective_function_value))
     )
@@ -132,7 +166,7 @@ def _solve_highs(model: ScheduleModel, time_limit: float, gap_rel: float | None)
     info = h.getInfo()
     has_solution = info.primal_solution_status == highspy.SolutionStatus.kSolutionStatusFeasible
     claimed = status == highspy.HighsModelStatus.kOptimal
-    return _Raw(
+    return RawSolution(
         values=np.asarray(h.getSolution().col_value) if has_solution else None,
         proven=claimed and _gap_closed(info.objective_function_value, info.mip_dual_bound, gap_rel),
         status=h.modelStatusToString(status),
@@ -140,9 +174,14 @@ def _solve_highs(model: ScheduleModel, time_limit: float, gap_rel: float | None)
     )
 
 
-def _solve_cuopt(model: ScheduleModel, time_limit: float, gap_rel: float | None) -> _Raw:
+def _solve_cuopt(
+    model: ScheduleModel,
+    time_limit: float,
+    gap_rel: float | None,
+    initial: FloatArray | None = None,
+) -> RawSolution:
+    """cuOpt MILP; `initial` is an optional valid schedule (all columns) to begin from."""
     from cuopt.linear_programming import (  # pyright: ignore[reportMissingImports]
-        data_model,
         solver,
         solver_settings,
     )
@@ -158,27 +197,28 @@ def _solve_cuopt(model: ScheduleModel, time_limit: float, gap_rel: float | None)
     trace: list[tuple[float, float]] = []
 
     class Trace(GetSolutionCallback):  # pyright: ignore[reportUntypedBaseClass]
-        def get_solution(self, solution: object, solution_cost: object) -> None:
-            cost = solution_cost.copy_to_host()[0]  # pyright: ignore[reportAttributeAccessIssue]
-            trace.append((time.perf_counter() - start, float(cost)))
+        def get_solution(
+            self,
+            solution: object,
+            solution_cost: Sequence[float],
+            solution_bound: Sequence[float],
+            user_data: object,
+        ) -> None:
+            trace.append((time.perf_counter() - start, float(solution_cost[0])))
 
-    dm = data_model.DataModel()
-    dm.set_csr_constraint_matrix(model.values, model.indices, model.offsets)
-    dm.set_constraint_lower_bounds(model.row_lower)
-    dm.set_constraint_upper_bounds(model.row_upper)
-    dm.set_objective_coefficients(model.cost)
-    dm.set_variable_lower_bounds(model.col_lower)
-    dm.set_variable_upper_bounds(model.col_upper)
-    dm.set_variable_types(np.where(model.integer, "I", "C"))
-
+    dm = cuopt_data_model(model)
+    if initial is not None:
+        dm.set_initial_primal_solution(np.asarray(initial, dtype=np.float64))
     with _quiet_stdout():
         settings = solver_settings.SolverSettings()
         settings.set_parameter("log_to_console", False)
         settings.set_parameter("time_limit", float(time_limit))
         settings.set_parameter("mip_relative_gap", float(gap_rel or 0.0))
         settings.set_parameter("mip_absolute_gap", _ABS_GAP)
+        for name, value in CUOPT_MIP_PARAMS.items():
+            settings.set_parameter(name, value)
         callback = Trace()
-        settings.set_mip_callback(callback)
+        settings.set_mip_callback(callback, None)
         solution = solver.Solve(dm, settings)
     if solution.get_error_status() != ErrorStatus.Success:
         raise RuntimeError(solution.get_error_message())
@@ -186,13 +226,13 @@ def _solve_cuopt(model: ScheduleModel, time_limit: float, gap_rel: float | None)
     values = np.asarray(solution.get_primal_solution(), dtype=np.float64)
     objective = solution.get_primal_objective()
     bound = solution.get_milp_stats()["solution_bound"]
-    # cuOpt 25.10 sometimes reports Optimal at the time limit while its own gap is ~100%
-    # (seen with a solution callback attached). Only trust the claim if the bound agrees.
+    # cuOpt 25.10 sometimes reported Optimal at the time limit while its own gap was ~100%
+    # (with a solution callback attached; not seen in 26.10). Only trust it if the bound agrees.
     proven = status == MILPTerminationStatus.Optimal and _gap_closed(objective, bound, gap_rel)
     name = status.name
     if status == MILPTerminationStatus.Optimal and not proven:
         name += f" (unproven: objective {objective:g}, bound {bound:g})"
-    return _Raw(
+    return RawSolution(
         values=values if len(values) else None,
         proven=proven,
         status=name,
@@ -236,7 +276,12 @@ def classify(model: ScheduleModel, values: FloatArray | None, proven: bool) -> O
     return Outcome.OPTIMAL if proven else Outcome.FEASIBLE
 
 
-_SOLVERS = {Backend.CPU: _solve_highs, Backend.GPU: _solve_cuopt}
+def _solve_cuopt_warm(
+    model: ScheduleModel, time_limit: float, gap_rel: float | None
+) -> RawSolution:
+    from cuopt_scheduler.lp_round import warm_started_mip  # lp_round imports this module
+
+    return warm_started_mip(model, time_limit, gap_rel)
 
 
 def solve(
@@ -244,10 +289,16 @@ def solve(
     backend: Backend = Backend.CPU,
     time_limit: float = 30,
     gap_rel: float | None = None,
+    *,
+    warm_start: bool = True,
 ) -> SolveResult:
     """Solve `problem`. `gap_rel` lets the solver stop once it is provably within that
     fraction of the best possible objective (None = prove optimal); the result then
-    counts as optimal."""
+    counts as optimal.
+
+    On the GPU, `warm_start` first builds a schedule from cuOpt's PDLP LP solution and
+    hands it to cuOpt's MILP solver as a starting point (much faster to a good schedule;
+    see the README). Off, cuOpt's MILP solver starts from scratch."""
     start = time.perf_counter()
     model = build_model(problem)
     build_seconds = time.perf_counter() - start
@@ -257,18 +308,34 @@ def solve(
         warnings.append("cuOpt is not available; solved on CPU instead.")
         backend = Backend.CPU
 
+    gpu_solver = _solve_cuopt_warm if warm_start else _solve_cuopt
     start = time.perf_counter()
     try:
-        raw = _SOLVERS[backend](model, time_limit, gap_rel)
+        if backend is Backend.CPU:
+            raw = _solve_highs(model, time_limit, gap_rel)
+        else:
+            raw = gpu_solver(model, time_limit, gap_rel)
     except Exception as exc:
         if backend is Backend.CPU:
             raise
         warnings.append(f"cuOpt failed ({exc}); solved on CPU instead.")
         backend = Backend.CPU
         start = time.perf_counter()
-        raw = _SOLVERS[backend](model, time_limit, gap_rel)
+        raw = _solve_highs(model, time_limit, gap_rel)
     elapsed = time.perf_counter() - start
 
+    return make_result(model, raw, backend, elapsed, build_seconds, tuple(warnings))
+
+
+def make_result(
+    model: ScheduleModel,
+    raw: RawSolution,
+    backend: Backend,
+    solve_seconds: float,
+    build_seconds: float,
+    warnings: tuple[str, ...] = (),
+) -> SolveResult:
+    """Check a solver's answer against `model` and turn it into a SolveResult."""
     outcome = classify(model, raw.values, raw.proven)
     assignments: tuple[Assignment, ...] = ()
     objective = None
@@ -281,16 +348,16 @@ def solve(
                 for emp, s, d in (model.x_keys[i] for i in chosen)
             )
         )
-        # Recomputed from the rounded solution, so both backends report it the same way.
+        # Recomputed from the rounded solution, so every method reports it the same way.
         objective = float(model.cost @ np.round(raw.values, 6))
     return SolveResult(
         outcome=outcome,
         solver_status=raw.status,
         backend=backend,
-        solve_seconds=elapsed,
+        solve_seconds=solve_seconds,
         objective=objective,
         assignments=assignments,
-        warnings=tuple(warnings),
+        warnings=warnings,
         build_seconds=build_seconds,
         incumbents=raw.incumbents,
     )

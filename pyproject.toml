@@ -15,14 +15,17 @@ dependencies = [
 
 [project.scripts]
 cuopt-bench = "cuopt_scheduler.benchmark:main"
+cuopt-plots = "cuopt_scheduler.plots:main"  # needs matplotlib (dev group)
 
 [project.optional-dependencies]
 # The cuOpt Python library (not the REST server), called directly.
-gpu = ["cuopt-cu13==25.10.*; sys_platform == 'linux'"]
+gpu = ["cuopt-cu13==26.10.*; sys_platform == 'linux'"]
 
 [dependency-groups]
 dev = [
     "hypothesis>=6.100",
+    "matplotlib>=3.9",
+    "pre-commit>=4",
     "pyright>=1.1.390",
     "pytest>=8",
     "ruff>=0.8",
@@ -31,10 +34,6 @@ dev = [
 [build-system]
 requires = ["uv_build>=0.9,<0.14"]
 build-backend = "uv_build"
-
-[tool.uv]
-# cuOpt 25.10 links against libcudss.so.0; cudss 0.8+ ships .so.1 and cuOpt fails to load.
-constraint-dependencies = ["nvidia-cudss-cu13<0.8"]
 
 # Not `explicit`: cuOpt's transitive RAPIDS deps (libcuopt-cu13, cuvs-cu13, ...) are only
 # placeholder sdists on PyPI, so they must resolve from NVIDIA's index too. In practice only
@@ -48,7 +47,23 @@ line-length = 100
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "B", "UP", "SIM"]
+select = [
+    "E", "W",  # pycodestyle
+    "F",       # pyflakes
+    "I",       # isort
+    "B",       # bugbear
+    "UP",      # pyupgrade
+    "SIM",     # simplify
+    "C4",      # comprehensions
+    "PIE",     # misc. lints
+    "RET",     # return statements
+    "PERF",    # performance anti-patterns
+    "PT",      # pytest style
+    "NPY",     # numpy
+    "PTH",     # pathlib over os.path
+    "RUF",     # ruff-specific
+]
+allowed-confusables = ["×", "–"]  # multiplication sign, en dash (empty table cell)
 
 [tool.pyright]
 include = ["src", "tests", "app.py"]
