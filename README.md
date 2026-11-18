@@ -23,8 +23,6 @@ This project solves a nurse rostering problem as a mixed-integer program, on a l
 * **Never just "Infeasible":** When there aren't enough staff, the app still produces the best schedule and lists exactly which shifts are short.
 * **Export:** Download optimized schedules as CSV files.
 
-<img alt="The How it was solved tab: the LP relaxation solved on the GPU in 0.03 s, shown as a grid of employees by day and shift with fractional values such as 0.23 and 0.33, because interchangeable staff share shifts in the relaxation. Crosses mark shifts a person can't work." src="docs/img/explain-tab.png" width="720">
-
 ## 🛠️ Prerequisites
 
 * **Python:** 3.11+ and [uv](https://docs.astral.sh/uv/).
@@ -42,15 +40,56 @@ The NVIDIA package index is configured in `pyproject.toml`, and `uv.lock` pins e
 
 ## 🖥️ Usage
 
+### Run the app
+
 ```bash
-uv run streamlit run app.py
+uv sync --extra gpu            # with an NVIDIA GPU; plain `uv sync` for CPU only
+uv run streamlit run app.py    # opens http://localhost:8501
 ```
 
-* Open `http://localhost:8501`.
-* In the **Sidebar**, set the number of wards, employees, schedule length and a random seed (same seed, same data). About 45 employees per ward cover all demand.
-* Adjust the minimum rest, time limit and an optional optimality gap.
-* Toggle **"Use NVIDIA GPU"**, or tick **compare** to solve on both. Both are disabled when cuOpt is not available.
-* Click **Generate & Solve**.
+Without a GPU (or without the `gpu` extra) the app still works: it solves with HiGHS on the CPU, and the GPU toggle and *compare* box are disabled.
+
+1. In the **sidebar**, set the problem:
+   - **Data:** wards, employees, schedule length and a random seed (the same seed gives the same data). About 45 employees per ward cover all demand.
+   - **Rules:** minimum rest and difficulty level, which adds rules on top of the base set.
+   - **Solver:** time limit and an optional optimality gap.
+2. Toggle **Use NVIDIA GPU (cuOpt)**, and tick **Also solve on the other backend and compare** to run the GPU and the CPU on the same problem.
+3. Click **Generate & Solve**. A progress bar per solver shows the step it is on, the time used against the limit, and the best schedule found so far.
+
+<img alt="Solving 900 employees over 28 days on the hardest rules: the GPU line already reads 'Done in 0.44 s: proven optimal' while the CPU's HiGHS branch and bound is still running at 3 s." src="docs/img/app-solving.png" width="720">
+
+The results come in five tabs:
+
+| Tab | What it shows |
+|---|---|
+| 📅 Visual Schedule | Gantt chart of every shift, per employee |
+| 📊 Coverage Analysis | staff per shift and day, and any shifts left short of staff |
+| 📝 Detailed List | the schedule as a table, with CSV download |
+| ⏱️ Where the time went | each solver's steps on a timeline, and the best schedule found over time |
+| 🎓 How it was solved | the MILP explained on your problem: decisions, rules, cost, LP relaxation, rounding and the optimality proof |
+
+With *compare* ticked, a summary above the tabs gives both times and the speed-up:
+
+<img alt="CPU vs GPU summary for 900 employees, 28 days, difficulty 3: GPU 0.31 s, CPU 6.09 s, a 19.9 times speed-up, both optimal with the same cost of 8,400 and no uncovered slots." src="docs/img/app-compare.png" width="720">
+
+<img alt="Where the time went: the GPU bar is 0.34 s, mostly the LP relaxation (blue) with short rounding and proof steps; the CPU bar is 6.14 s of branch and bound (orange). Below, best schedule found over time on log scales: the GPU has its single proven-optimal schedule at about 0.3 s, while HiGHS starts above a million at about 4.5 s and steps down to the same optimum at about 6 s." src="docs/img/app-timeline.png" width="720">
+
+### Demo examples
+
+Each example below is a set of sidebar settings; anything not listed stays at its default (seed 42, 11 h rest, time limit 30 s, gap 0). Times are from the RTX 4080 laptop used for the benchmarks.
+
+| # | Example | Sidebar settings | What to look at |
+|---|---|---|---|
+| 1 | **First look** | defaults: 1 ward, 45 employees, 7 days, difficulty 0 | Optimal in a few hundredths of a second on either backend. Open **🎓 How it was solved**: 945 yes/no decisions, the rules as constraints, and *"Gap below 1: the LP bound proves this schedule optimal"*. |
+| 2 | **Not enough staff** | employees 20 | 24 staff slots can't be covered. **📊 Coverage Analysis** lists them. The schedule is still optimal: the cost counts each missing person, so the solver covers as much as possible. |
+| 3 | **When the LP bound isn't enough** | employees 12, difficulty 3 | Rounding ends a few cost units above the LP bound, so the bound alone can't prove it. **🎓** explains that the MILP solver closed the gap by search; on the GPU, **⏱️** shows the extra branch-and-bound step after the LP. |
+| 4 | **CPU vs GPU race** | wards 8, employees 300, days 28, difficulty 3, compare ✔ | Same optimal cost on both. The GPU proves it in about 0.1–0.2 s, HiGHS's branch and bound in about 2 s. Watch the CPU's best schedule improve live under its progress bar. |
+| 5 | **Bigger race** | wards 20, employees 900, days 28, difficulty 3, compare ✔ | About 0.2–0.3 s on the GPU against about 6 s on the CPU (20–30×), the screenshots above. **⏱️** shows the GPU's time is almost all the LP relaxation, and the CPU's all search. |
+| 6 | **Harder rules need search** | employees 34, days 28; solve at difficulty 0, then again at 3 | Same cost (420) both times, but at difficulty 3 the LP bound no longer closes the gap: **⏱️** shows the GPU adding a branch-and-bound step (about 0.03 s → 0.4 s). Tighter rules make the relaxation a weaker guide, which is when MILP search earns its keep. |
+
+The **🎓 How it was solved** tab, for example 1:
+
+<img alt="The How it was solved tab: the LP relaxation solved on the GPU in 0.03 s, shown as a grid of employees by day and shift with fractional values such as 0.23 and 0.33, because interchangeable staff share shifts in the relaxation. Crosses mark shifts a person can't work." src="docs/img/explain-tab.png" width="720">
 
 ## 📈 GPU vs CPU
 

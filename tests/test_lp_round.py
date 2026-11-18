@@ -186,3 +186,38 @@ def test_warm_start_keeps_the_rounded_schedule_if_the_milp_solver_fails(
     assert result.outcome is Outcome.FEASIBLE
     assert "Memory allocation failed" in result.solver_status
     assert result.objective == schedule_cost(problem, result.assignments)
+
+
+def test_lp_round_reports_its_phases() -> None:
+    from cuopt_scheduler.lp_round import BOUND_PHASE, LP_PHASE, ROUND_PHASE
+
+    result = solve_lp_round(generate_problem(45, 14, seed=1, level=3))
+    assert [label for label, _ in result.phases] == [
+        LP_PHASE[LPEngine.HIGHS],
+        ROUND_PHASE,
+        BOUND_PHASE,
+    ]
+    assert sum(s for _, s in result.phases) == pytest.approx(result.solve_seconds, abs=0.05)
+
+
+@pytest.mark.gpu
+def test_gpu_phases_and_progress_with_and_without_the_milp_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cuopt_scheduler.lp_round import BOUND_PHASE, LP_PHASE, ROUND_PHASE
+    from cuopt_scheduler.solver import CUOPT_SEARCH, ProgressLog
+
+    steps = [LP_PHASE[LPEngine.CUOPT_PDLP], ROUND_PHASE, BOUND_PHASE]
+    problem = generate_problem(68, 14, seed=2, wards=2, level=3)
+    progress = ProgressLog()
+    proven = solve(problem, Backend.GPU, time_limit=60, progress=progress)
+    assert [label for label, _ in proven.phases] == steps
+    assert progress.incumbents[0][1] == proven.objective  # the rounded schedule
+
+    _no_lp_proof(monkeypatch)
+    progress = ProgressLog()
+    searched = solve(problem, Backend.GPU, time_limit=60, progress=progress)
+    assert [label for label, _ in searched.phases] == [*steps, CUOPT_SEARCH]
+    assert progress.phase == CUOPT_SEARCH
+    # Live times are offset by the LP steps, like the result's own trace.
+    assert progress.incumbents[0][0] <= progress.incumbents[-1][0] <= searched.solve_seconds

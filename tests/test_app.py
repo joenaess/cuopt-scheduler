@@ -35,7 +35,7 @@ def test_default_settings_cover_all_demand() -> None:
     assert at.success
     assert "Optimal schedule found with CPU (HiGHS)" in at.success[0].value
     assert not at.warning
-    assert len(at.tabs) == 4
+    assert len(at.tabs) == 5
     # The "How it was solved" tab: the LP bound proves this schedule optimal.
     assert any("bound proves this schedule optimal" in s.value for s in at.success)
     assert any("Rule" in df.value.columns for df in at.dataframe)

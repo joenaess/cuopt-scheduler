@@ -12,7 +12,7 @@ import os
 import sys
 import time
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -70,6 +70,8 @@ class SolveResult:
     """Time to build the model arrays (shared by both backends)."""
     incumbents: tuple[tuple[float, float], ...] = ()
     """(seconds into the solve, objective) each time the solver found a better schedule."""
+    phases: tuple[tuple[str, float], ...] = ()
+    """(what the solver did, seconds), in order; they add up to about `solve_seconds`."""
 
     @property
     def feasible(self) -> bool:
@@ -83,6 +85,22 @@ class RawSolution:
     """The solver proved this solution optimal (within the requested gap)."""
     status: str
     incumbents: tuple[tuple[float, float], ...] = ()
+    phases: tuple[tuple[str, float], ...] = ()
+
+
+@dataclass
+class ProgressLog:
+    """Live progress of a solve, for a UI polling it from another thread.
+
+    The solver sets `phase` as it moves on and appends to `incumbents` (seconds into the
+    solve, objective) each time it has a better schedule.
+    """
+
+    phase: str = ""
+    incumbents: list[tuple[float, float]] = field(default_factory=list)
+
+    def found(self, seconds: float, objective: float) -> None:
+        self.incumbents.append((seconds, objective))
 
 
 def _gap_closed(objective: float, bound: float, gap_rel: float | None) -> bool:
@@ -151,15 +169,30 @@ def cuopt_data_model(model: ScheduleModel, *, relax: bool = False) -> Any:
     return dm
 
 
-def _solve_highs(model: ScheduleModel, time_limit: float, gap_rel: float | None) -> RawSolution:
+HIGHS_SEARCH = "Branch and bound: HiGHS MILP (CPU)"
+CUOPT_SEARCH = "Branch and bound: cuOpt MILP (GPU)"
+
+
+def _solve_highs(
+    model: ScheduleModel,
+    time_limit: float,
+    gap_rel: float | None,
+    progress: ProgressLog | None = None,
+) -> RawSolution:
     start = time.perf_counter()
     trace: list[tuple[float, float]] = []
+    if progress:
+        progress.phase = HIGHS_SEARCH
+
+    def improved(e: Any) -> None:
+        trace.append((time.perf_counter() - start, e.data_out.objective_function_value))
+        if progress:
+            progress.found(*trace[-1])
+
     h = highs_model(model, time_limit)
     h.setOptionValue("mip_rel_gap", float(gap_rel or 0.0))
     h.setOptionValue("mip_abs_gap", _ABS_GAP)
-    h.cbMipImprovingSolution.subscribe(
-        lambda e: trace.append((time.perf_counter() - start, e.data_out.objective_function_value))
-    )
+    h.cbMipImprovingSolution.subscribe(improved)
     h.run()
 
     status = h.getModelStatus()
@@ -171,6 +204,7 @@ def _solve_highs(model: ScheduleModel, time_limit: float, gap_rel: float | None)
         proven=claimed and _gap_closed(info.objective_function_value, info.mip_dual_bound, gap_rel),
         status=h.modelStatusToString(status),
         incumbents=tuple(trace),
+        phases=((HIGHS_SEARCH, time.perf_counter() - start),),
     )
 
 
@@ -179,8 +213,13 @@ def _solve_cuopt(
     time_limit: float,
     gap_rel: float | None,
     initial: FloatArray | None = None,
+    progress: ProgressLog | None = None,
+    offset: float = 0.0,
 ) -> RawSolution:
-    """cuOpt MILP; `initial` is an optional valid schedule (all columns) to begin from."""
+    """cuOpt MILP; `initial` is an optional valid schedule (all columns) to begin from.
+
+    `offset` is added to the times reported to `progress` (for a solve that is one step of
+    a longer one)."""
     from cuopt.linear_programming import (  # pyright: ignore[reportMissingImports]
         solver,
         solver_settings,
@@ -205,7 +244,11 @@ def _solve_cuopt(
             user_data: object,
         ) -> None:
             trace.append((time.perf_counter() - start, float(solution_cost[0])))
+            if progress:
+                progress.found(offset + trace[-1][0], trace[-1][1])
 
+    if progress:
+        progress.phase = CUOPT_SEARCH
     dm = cuopt_data_model(model)
     if initial is not None:
         dm.set_initial_primal_solution(np.asarray(initial, dtype=np.float64))
@@ -237,6 +280,7 @@ def _solve_cuopt(
         proven=proven,
         status=name,
         incumbents=tuple(trace),
+        phases=((CUOPT_SEARCH, time.perf_counter() - start),),
     )
 
 
@@ -277,11 +321,14 @@ def classify(model: ScheduleModel, values: FloatArray | None, proven: bool) -> O
 
 
 def _solve_cuopt_warm(
-    model: ScheduleModel, time_limit: float, gap_rel: float | None
+    model: ScheduleModel,
+    time_limit: float,
+    gap_rel: float | None,
+    progress: ProgressLog | None = None,
 ) -> RawSolution:
     from cuopt_scheduler.lp_round import warm_started_mip  # lp_round imports this module
 
-    return warm_started_mip(model, time_limit, gap_rel)
+    return warm_started_mip(model, time_limit, gap_rel, progress)
 
 
 def solve(
@@ -291,6 +338,7 @@ def solve(
     gap_rel: float | None = None,
     *,
     warm_start: bool = True,
+    progress: ProgressLog | None = None,
 ) -> SolveResult:
     """Solve `problem`. `gap_rel` lets the solver stop once it is provably within that
     fraction of the best possible objective (None = prove optimal); the result then
@@ -298,7 +346,11 @@ def solve(
 
     On the GPU, `warm_start` first builds a schedule from cuOpt's PDLP LP solution and
     hands it to cuOpt's MILP solver as a starting point (much faster to a good schedule;
-    see the README). Off, cuOpt's MILP solver starts from scratch."""
+    see the README). Off, cuOpt's MILP solver starts from scratch.
+
+    `progress`, if given, is updated as the solve goes (see `ProgressLog`)."""
+    if progress:
+        progress.phase = "Building the model"
     start = time.perf_counter()
     model = build_model(problem)
     build_seconds = time.perf_counter() - start
@@ -312,16 +364,18 @@ def solve(
     start = time.perf_counter()
     try:
         if backend is Backend.CPU:
-            raw = _solve_highs(model, time_limit, gap_rel)
+            raw = _solve_highs(model, time_limit, gap_rel, progress)
         else:
-            raw = gpu_solver(model, time_limit, gap_rel)
+            raw = gpu_solver(model, time_limit, gap_rel, progress=progress)
     except Exception as exc:
         if backend is Backend.CPU:
             raise
         warnings.append(f"cuOpt failed ({exc}); solved on CPU instead.")
         backend = Backend.CPU
+        if progress:
+            progress.incumbents.clear()
         start = time.perf_counter()
-        raw = _solve_highs(model, time_limit, gap_rel)
+        raw = _solve_highs(model, time_limit, gap_rel, progress)
     elapsed = time.perf_counter() - start
 
     return make_result(model, raw, backend, elapsed, build_seconds, tuple(warnings))
@@ -360,4 +414,5 @@ def make_result(
         warnings=warnings,
         build_seconds=build_seconds,
         incumbents=raw.incumbents,
+        phases=raw.phases,
     )
