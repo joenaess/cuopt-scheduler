@@ -314,3 +314,14 @@ def test_dislikes_raise_the_cost_and_are_avoided() -> None:
     result = solve(p)
     assert result.assignments == (Assignment(0, "Day", "B"),)
     assert build_model(p).cost[build_model(p).x_keys.index(("A", "Day", 0))] == 2
+
+
+def test_phases_and_live_progress_on_the_cpu() -> None:
+    from cuopt_scheduler.solver import HIGHS_SEARCH, ProgressLog
+
+    progress = ProgressLog()
+    result = solve(generate_problem(30, 7, seed=4, level=3), progress=progress)
+    assert [label for label, _ in result.phases] == [HIGHS_SEARCH]
+    assert sum(s for _, s in result.phases) == pytest.approx(result.solve_seconds, abs=0.05)
+    assert progress.phase == HIGHS_SEARCH
+    assert progress.incumbents == list(result.incumbents)

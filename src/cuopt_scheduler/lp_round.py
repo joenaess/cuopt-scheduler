@@ -29,7 +29,9 @@ import numpy as np
 from cuopt_scheduler.data import Problem
 from cuopt_scheduler.model import FloatArray, ScheduleModel, build_model
 from cuopt_scheduler.solver import (
+    CUOPT_SEARCH,
     Backend,
+    ProgressLog,
     RawSolution,
     SolveResult,
     _gap_closed,
@@ -170,18 +172,67 @@ def solve_lp_round(
     build_seconds = time.perf_counter() - start
 
     start = time.perf_counter()
-    lp = solve_lp(model, engine, time_limit)
-    values = round_lp(model, lp.primal)
-    first = time.perf_counter() - start
-    proven, bound = lp_bound_proves(model, values, lp, gap_rel)
+    values, _, proven, bound, phases = _relax_round_prove(model, engine, time_limit, gap_rel)
+    first = sum(s for _, s in phases[:2])
     elapsed = time.perf_counter() - start
     objective = float(model.cost @ values)
     status = f"LP ({engine}) + rounding, LP bound {bound:g}"
-    raw = RawSolution(values, proven, status, ((first, objective),))
+    raw = RawSolution(values, proven, status, ((first, objective),), phases)
     return _checked(make_result(model, raw, engine.backend, elapsed, build_seconds))
 
 
-def warm_started_mip(model: ScheduleModel, time_limit: float, gap_rel: float | None) -> RawSolution:
+LP_PHASE = {
+    LPEngine.HIGHS: "LP relaxation: HiGHS simplex (CPU)",
+    LPEngine.HIGHS_PDLP: "LP relaxation: HiGHS PDLP (CPU)",
+    LPEngine.CUOPT_PDLP: "LP relaxation: cuOpt PDLP (GPU)",
+}
+ROUND_PHASE = "Rounding to a valid schedule (CPU)"
+BOUND_PHASE = "Lower bound from the LP: proof check (CPU)"
+
+
+def _relax_round_prove(
+    model: ScheduleModel,
+    engine: LPEngine,
+    time_limit: float,
+    gap_rel: float | None,
+    progress: ProgressLog | None = None,
+) -> tuple[FloatArray, LPSolution, bool, float, tuple[tuple[str, float], ...]]:
+    """Solve the LP, round it and check the bound, timing each step."""
+    phases: list[tuple[str, float]] = []
+    clock = time.perf_counter()
+
+    def begin(label: str) -> None:
+        if progress:
+            progress.phase = label
+
+    def done(label: str) -> float:
+        """Record `label` as finished; return seconds since the first step began."""
+        nonlocal clock
+        now = time.perf_counter()
+        phases.append((label, now - clock))
+        clock = now
+        return sum(s for _, s in phases)
+
+    begin(LP_PHASE[engine])
+    lp = solve_lp(model, engine, time_limit)
+    done(LP_PHASE[engine])
+    begin(ROUND_PHASE)
+    rounded = round_lp(model, lp.primal)
+    elapsed = done(ROUND_PHASE)
+    if progress:
+        progress.found(elapsed, float(model.cost @ rounded))
+    begin(BOUND_PHASE)
+    proven, bound = lp_bound_proves(model, rounded, lp, gap_rel)
+    done(BOUND_PHASE)
+    return rounded, lp, proven, bound, tuple(phases)
+
+
+def warm_started_mip(
+    model: ScheduleModel,
+    time_limit: float,
+    gap_rel: float | None,
+    progress: ProgressLog | None = None,
+) -> RawSolution:
     """cuOpt PDLP + rounding, then, unless the LP bound already proves that schedule
     optimal, cuOpt's MILP solver starting from it.
 
@@ -189,23 +240,35 @@ def warm_started_mip(model: ScheduleModel, time_limit: float, gap_rel: float | N
     time limit covers both steps. Used by `solve(..., Backend.GPU)`.
     """
     start = time.perf_counter()
-    lp = solve_lp(model, LPEngine.CUOPT_PDLP, time_limit)
-    rounded = round_lp(model, lp.primal)
-    first = ((time.perf_counter() - start, float(model.cost @ rounded)),)
-    proven, bound = lp_bound_proves(model, rounded, lp, gap_rel)
+    rounded, _, proven, bound, phases = _relax_round_prove(
+        model, LPEngine.CUOPT_PDLP, time_limit, gap_rel, progress
+    )
+    first = ((sum(s for _, s in phases[:2]), float(model.cost @ rounded)),)
     if proven:
-        return RawSolution(rounded, True, f"LP + rounding, proven by LP bound {bound:g}", first)
+        status = f"LP + rounding, proven by LP bound {bound:g}"
+        return RawSolution(rounded, True, status, first, phases)
     t_lp = time.perf_counter() - start
+    mip_start = time.perf_counter()
     try:
-        raw = _solve_cuopt(model, max(1.0, time_limit - t_lp), gap_rel, initial=rounded)
+        raw = _solve_cuopt(
+            model,
+            max(1.0, time_limit - t_lp),
+            gap_rel,
+            initial=rounded,
+            progress=progress,
+            offset=t_lp,
+        )
     except Exception as exc:
         # E.g. out of GPU memory: the MILP solver needs far more than PDLP. The rounded
         # schedule is still valid, so keep it rather than start over on the CPU.
-        return RawSolution(rounded, False, f"cuOpt MILP failed ({exc}); rounded LP", first)
+        failed = (*phases, (CUOPT_SEARCH + ", failed", time.perf_counter() - mip_start))
+        status = f"cuOpt MILP failed ({exc}); rounded LP"
+        return RawSolution(rounded, False, status, first, failed)
     trace = (*first, *((t_lp + t, o) for t, o in raw.incumbents))
+    phases = (*phases, *raw.phases)
     if raw.values is None:  # cuOpt returned nothing: keep the rounded schedule
-        return RawSolution(rounded, False, raw.status, trace)
-    return RawSolution(raw.values, raw.proven, raw.status, trace)
+        return RawSolution(rounded, False, raw.status, trace, phases)
+    return RawSolution(raw.values, raw.proven, raw.status, trace, phases)
 
 
 def _checked(result: SolveResult) -> SolveResult:

@@ -1,6 +1,8 @@
 """Streamlit UI. All scheduling logic lives in the cuopt_scheduler package."""
 
 import dataclasses
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -15,7 +17,7 @@ from cuopt_scheduler import (
     generate_problem,
     solve,
 )
-from cuopt_scheduler.data import LEVELS
+from cuopt_scheduler.data import LEVELS, Problem
 from cuopt_scheduler.explain import (
     Explanation,
     cost_breakdown,
@@ -26,7 +28,14 @@ from cuopt_scheduler.explain import (
 )
 from cuopt_scheduler.frames import demand_frame, employees_frame, gaps_frame, schedule_frame
 from cuopt_scheduler.lp_round import LPEngine
-from cuopt_scheduler.viz import coverage_figure, decision_grid_figure, gantt_figure
+from cuopt_scheduler.solver import ProgressLog
+from cuopt_scheduler.viz import (
+    convergence_figure,
+    coverage_figure,
+    decision_grid_figure,
+    gantt_figure,
+    phase_timeline_figure,
+)
 
 st.set_page_config(page_title="NVIDIA cuOpt Scheduler", layout="wide")
 st.title("🏥 Intelligent Staff Scheduler")
@@ -85,24 +94,68 @@ with st.sidebar:
         help="0 = solver default. A small gap often saves a lot of time.",
     )
 
-    if st.button("Generate & Solve", type="primary"):
-        problem = dataclasses.replace(
-            generate_problem(num_emp, duration, seed=int(seed), wards=wards, level=level),
-            min_rest_hours=min_rest,
+    clicked = st.button("Generate & Solve", type="primary")
+
+
+def engine(r: SolveResult) -> str:
+    return "🚀 NVIDIA cuOpt" if r.backend is Backend.GPU else "CPU (HiGHS)"
+
+
+METHOD = {
+    Backend.GPU: "GPU: cuOpt PDLP + rounding + LP bound (MILP only if unproven)",
+    Backend.CPU: "CPU: HiGHS MILP (branch and bound)",
+}
+
+
+def solve_with_progress(
+    problem: Problem, backend: Backend, time_limit: float, gap: float | None
+) -> SolveResult:
+    """Solve in a worker thread while a progress bar shows elapsed time, the solver's
+    current step and the best schedule so far."""
+    progress = ProgressLog()
+    st.markdown(f"**{METHOD[backend]}**")
+    bar = st.progress(0.0)
+    best = st.empty()
+    start = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            solve, problem, backend, time_limit=time_limit, gap_rel=gap, progress=progress
         )
-        primary = Backend.GPU if use_gpu else Backend.CPU
-        backends = [primary]
-        if compare and gpu_ok:
-            backends.append(Backend.CPU if use_gpu else Backend.GPU)
-        gap = gap_pct / 100 or None
-        results: list[SolveResult] = []
-        for backend in backends:
-            with st.spinner(f"Optimizing schedule on {backend.upper()}..."):
-                results.append(solve(problem, backend, time_limit=time_limit, gap_rel=gap))
-        with st.spinner("Preparing the explanation (LP relaxation)..."):
-            explanation = explain(problem, primary)
-        # Keep results across reruns (e.g. clicking the download button).
-        st.session_state["run"] = (problem, results, explanation)
+        while not future.done():
+            elapsed = time.perf_counter() - start
+            bar.progress(
+                min(elapsed / time_limit, 1.0),
+                text=f"{progress.phase or 'Starting'}… {elapsed:.1f} s (time limit {time_limit} s)",
+            )
+            if progress.incumbents:
+                t, cost = min(progress.incumbents, key=lambda i: i[1])
+                best.caption(f"Best schedule so far: cost {cost:,.0f}, found after {t:.2f} s")
+            time.sleep(0.1)
+    result = future.result()
+    total = time.perf_counter() - start
+    verdict = "proven optimal" if result.outcome is Outcome.OPTIMAL else result.outcome.value
+    bar.progress(min(total / time_limit, 1.0), text=f"Done in {total:.2f} s: {verdict}")
+    best.empty()
+    return result
+
+
+if clicked:
+    problem = dataclasses.replace(
+        generate_problem(num_emp, duration, seed=int(seed), wards=wards, level=level),
+        min_rest_hours=min_rest,
+    )
+    primary = Backend.GPU if use_gpu else Backend.CPU
+    backends = [primary]
+    if compare and gpu_ok:
+        backends.append(Backend.CPU if use_gpu else Backend.GPU)
+    gap = gap_pct / 100 or None
+    with st.status("Solving…", expanded=True) as status:
+        results = [solve_with_progress(problem, b, time_limit, gap) for b in backends]
+        st.write("Preparing the explanation (LP relaxation)…")
+        explanation = explain(problem, primary)
+        status.update(label="Solved", state="complete", expanded=False)
+    # Keep results across reruns (e.g. clicking the download button).
+    st.session_state["run"] = (problem, results, explanation)
 
 run = st.session_state.get("run")
 if run is None:
@@ -121,16 +174,26 @@ if run is None:
 problem, results, explanation = run
 result = results[0]
 
-
-def engine(r: SolveResult) -> str:
-    return "🚀 NVIDIA cuOpt" if r.backend is Backend.GPU else "CPU (HiGHS)"
-
-
 for warning in result.warnings:
     st.warning(warning)
 
 if len(results) > 1:
     st.subheader("CPU vs GPU")
+    by = {r.backend: r for r in results}
+    gpu, cpu = by.get(Backend.GPU), by.get(Backend.CPU)
+    if gpu and cpu and gpu.backend is not cpu.backend:
+        c = st.columns(3)
+        c[0].metric("GPU", f"{gpu.solve_seconds:.2f} s", help=METHOD[Backend.GPU])
+        c[1].metric("CPU", f"{cpu.solve_seconds:.2f} s", help=METHOD[Backend.CPU])
+        both_proven = gpu.outcome is cpu.outcome is Outcome.OPTIMAL
+        ratio = cpu.solve_seconds / max(gpu.solve_seconds, 1e-9)
+        c[2].metric(
+            "GPU speed-up" if both_proven else "Time ratio (CPU / GPU)",
+            f"{ratio:.1f}×",
+            help="Both proved the same optimal cost."
+            if both_proven
+            else ("Not both proven optimal, so this compares unequal results; see the table."),
+        )
     st.dataframe(
         pd.DataFrame(
             {
@@ -168,11 +231,12 @@ if gaps:
     )
 
 schedule = schedule_frame(problem, result.assignments)
-tab1, tab2, tab3, tab4 = st.tabs(
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
     [
         "📅 Visual Schedule (Gantt)",
         "📊 Coverage Analysis",
         "📝 Detailed List",
+        "⏱️ Where the time went",
         "🎓 How it was solved",
     ]
 )
@@ -334,4 +398,33 @@ def how_it_was_solved(result: SolveResult, ex: Explanation) -> None:
 
 
 with tab4:
+    st.markdown(
+        "Each solve is a sequence of steps. The **GPU path** solves the LP relaxation on the "
+        "GPU (cuOpt PDLP), then rounds it and checks the LP's lower bound on the CPU; it "
+        "only falls back to a MILP search if that bound can't prove the schedule optimal. "
+        "The **CPU path** runs HiGHS's MILP solver: branch and bound, which keeps finding "
+        "better schedules until it can prove none is cheaper. Tick *Also solve on the other "
+        "backend* to see both side by side."
+    )
+    st.plotly_chart(
+        phase_timeline_figure(
+            [(engine(r), [("Building the model", r.build_seconds), *r.phases]) for r in results]
+        ),
+        width="stretch",
+    )
+    st.plotly_chart(
+        convergence_figure(
+            [
+                (engine(r), r.incumbents, r.solve_seconds, r.outcome is Outcome.OPTIMAL)
+                for r in results
+            ]
+        ),
+        width="stretch",
+    )
+    st.caption(
+        "Each point is a better schedule found during the solve. The LP route has one "
+        "schedule, found at once; branch and bound improves step by step."
+    )
+
+with tab5:
     how_it_was_solved(result, explanation)

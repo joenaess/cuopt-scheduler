@@ -106,3 +106,45 @@ def test_decision_grid_figure_marks_fractions_and_unavailable_cells() -> None:
     text = [cell for row in fig.data[0].text for cell in row]  # pyright: ignore[reportAttributeAccessIssue]
     assert text.count("✕") == int(grid.isna().to_numpy().sum()) > 0
     assert "0.50" in text
+
+
+def test_phase_timeline_draws_each_phase_once_and_each_kind_in_the_legend() -> None:
+    from cuopt_scheduler.viz import phase_timeline_figure
+
+    fig = phase_timeline_figure(
+        [
+            (
+                "GPU",
+                [("Building the model", 0.01), ("LP relaxation: x", 0.2), ("Rounding x", 0.01)],
+            ),
+            ("CPU", [("Building the model", 0.01), ("Branch and bound: y", 2.0)]),
+        ]
+    )
+    assert len(fig.data) == 5  # pyright: ignore[reportArgumentType]
+    legend = [t.name for t in fig.data if t.showlegend]  # pyright: ignore[reportAttributeAccessIssue]
+    assert legend == [
+        "Build the model",
+        "LP relaxation",
+        "Rounding",
+        "Branch and bound (MILP search)",
+    ]
+    # Bars run end to end: each starts where the previous one ended.
+    cpu = [t for t in fig.data if t.y[0] == "CPU"]  # pyright: ignore[reportAttributeAccessIssue]
+    assert cpu[1].base[0] == pytest.approx(0.01)  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def test_convergence_figure_marks_proof_and_skips_runs_without_schedules() -> None:
+    from cuopt_scheduler.viz import convergence_figure
+
+    fig = convergence_figure(
+        [
+            ("GPU", ((0.2, 105.0),), 0.25, True),
+            ("CPU", ((0.5, 50_000.0), (1.5, 105.0)), 2.0, False),
+            ("none", (), 30.0, False),
+        ]
+    )
+    assert [t.name for t in fig.data] == ["GPU", "CPU"]  # pyright: ignore[reportAttributeAccessIssue]
+    notes = [a.text for a in fig.layout.annotations]  # pyright: ignore[reportAttributeAccessIssue]
+    assert notes == ["✔ proven optimal", "stopped: not proven"]
+    # The line runs on to the end of the solve at the best cost.
+    assert list(fig.data[1].y) == [50_000.0, 105.0, 105.0]  # pyright: ignore[reportAttributeAccessIssue]
