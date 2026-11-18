@@ -27,7 +27,7 @@ SERIES: dict[str, str] = {
     "cuopt-mip": "cuOpt MILP (GPU)",
     "highs-pdlp+round": "HiGHS PDLP + rounding (CPU)",
     "cuopt-pdlp+round": "cuOpt PDLP + rounding (GPU)",
-    "cuopt-pdlp+round+mip": "cuOpt MILP from rounding (GPU)",
+    "cuopt-pdlp+round+mip": "cuOpt rounding, MILP if unproven (GPU)",
 }
 
 
@@ -74,10 +74,13 @@ def gpu_speedup(df: pd.DataFrame) -> pd.DataFrame:
     """Per problem: best CPU method's time to a good schedule / best GPU method's.
 
     > 1 means the GPU got there first. A method that never got within reach counts as
-    taking the whole time limit, so the ratio is then a lower (or upper) bound.
+    taking as long as the longest run on that problem (about the time limit), not its own
+    time: LP + rounding can finish quickly with a poor schedule. The ratio is then a lower
+    (or upper) bound.
     """
     keys = ["wards", "employees", "level", "days", "seed"]
-    t = df.assign(t=df["near_seconds"].fillna(df["seconds"]))
+    longest = df.groupby(keys)["seconds"].transform("max")
+    t = df.assign(t=df["near_seconds"].fillna(longest.where(df["seconds"].notna())))
     best = pd.pivot_table(t, values="t", index=keys, columns="device", aggfunc="min")
     best = best.dropna(subset=["cpu", "gpu"])
     return best.assign(speedup=best["cpu"] / best["gpu"]).reset_index()
@@ -86,15 +89,18 @@ def gpu_speedup(df: pd.DataFrame) -> pd.DataFrame:
 TABLE_METHODS: dict[str, str] = {
     "highs-mip": "HiGHS MILP (CPU)",
     "cuopt-mip": "cuOpt MILP (GPU)",
-    "cuopt-pdlp+round+mip": "cuOpt MILP from rounding (GPU)",
+    "cuopt-pdlp+round+mip": "cuOpt rounding, MILP if unproven (GPU)",
     "highs-simplex+round": "HiGHS simplex + rounding (CPU)",
     "highs-pdlp+round": "HiGHS PDLP + rounding (CPU)",
     "cuopt-pdlp+round": "cuOpt PDLP + rounding (GPU)",
 }
 
 
-def markdown_table(df: pd.DataFrame) -> str:
-    """Seconds to within 1% of the best, one row per problem; fastest in bold."""
+def markdown_table(df: pd.DataFrame, *, proof: bool = False) -> str:
+    """Seconds to within 1% of the best (or, with `proof`, to a proven optimum), one row per
+    problem; fastest in bold."""
+    if proof:
+        df = df.assign(near_seconds=df["seconds"].where(df["outcome"] == "optimal"))
 
     def cell(rows: pd.DataFrame, best: float) -> str:
         if rows.empty:
@@ -327,10 +333,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--out", type=Path, default=Path("docs/img"))
     parser.add_argument("--time-limit", type=float, default=120)
     parser.add_argument("--level-wards", type=int, default=80)
-    parser.add_argument("--table", action="store_true", help="print a Markdown table instead")
+    parser.add_argument(
+        "--table",
+        nargs="?",
+        const="near",
+        choices=["near", "proof"],
+        help="print a Markdown table instead: time to within 1%% (near) or to a proven optimum",
+    )
     args = parser.parse_args(argv)
     if args.table:
-        print(markdown_table(load(args.csv)))
+        print(markdown_table(load(args.csv), proof=args.table == "proof"))
         return
     for path in plot_all(args.csv, args.out, args.time_limit, args.level_wards):
         print(path)

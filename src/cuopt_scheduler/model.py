@@ -55,6 +55,36 @@ class ScheduleModel:
         # With weights, bincount returns float64; numpy's stubs only know the unweighted form.
         return np.bincount(rows, weights=weights, minlength=self.num_rows).astype(np.float64)
 
+    def lower_bound(self, row_duals: FloatArray) -> float:
+        """A guaranteed lower bound on the optimum (of the LP relaxation, so also of the MILP)
+        from any row multipliers, e.g. an approximate LP solver's duals.
+
+        The Lagrangian bound: for multipliers y, every feasible v has
+        cost @ v >= y @ (row bound) + sum_j min over [col_lower, col_upper] of (cost - A.T y)_j v_j,
+        taking each row's lower bound where y > 0 and its upper bound where y < 0. Multipliers
+        with the wrong sign for a row (pointing at an infinite bound) are set to 0 first, so
+        the bound holds whatever `row_duals` is. It is tight only if the duals are close to
+        optimal. Floating-point error is subtracted, so the result can be trusted as a proof.
+        """
+        y = np.asarray(row_duals, dtype=np.float64)
+        if y.shape != (self.num_rows,) or not np.all(np.isfinite(y)):
+            return -np.inf
+        has_lower, has_upper = np.isfinite(self.row_lower), np.isfinite(self.row_upper)
+        y = np.where(has_lower, y, np.minimum(y, 0.0))
+        y = np.where(has_upper, y, np.maximum(y, 0.0))
+        rows = np.repeat(np.arange(self.num_rows), np.diff(self.offsets))
+        aty = np.bincount(self.indices, weights=self.values * y[rows], minlength=self.num_cols)
+        reduced = self.cost - aty
+        row_bound = np.where(y > 0, self.row_lower, self.row_upper)
+        row_terms = np.where(y != 0, y * np.where(y != 0, row_bound, 0.0), 0.0)
+        col_bound = np.where(reduced > 0, self.col_lower, self.col_upper)
+        if np.any((reduced != 0) & ~np.isfinite(col_bound)):
+            return -np.inf
+        col_terms = reduced * np.where(reduced != 0, col_bound, 0.0)
+        # Summing ~10^7 float64 terms loses far less than 1e-9 of their total magnitude.
+        error = 1e-9 * (np.abs(row_terms).sum() + np.abs(col_terms).sum() + np.abs(aty).sum())
+        return float(row_terms.sum() + col_terms.sum() - error)
+
     def is_feasible(self, v: FloatArray, tol: float = 1e-6) -> bool:
         """True if `v` is a valid solution: right shape, integral where required, in bounds."""
         if v.shape != (self.num_cols,) or not np.all(np.isfinite(v)):

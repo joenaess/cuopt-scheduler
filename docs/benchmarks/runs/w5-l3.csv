@@ -1,7 +1,7 @@
 wards,employees,level,days,seed,method,device,outcome,seconds,build_seconds,objective,uncovered,first_seconds,near_seconds
 5,170,3,28,0,highs-mip,cpu,optimal,1.039,0.003,2100.0,0,0.756,1.037
 5,170,3,28,0,cuopt-mip,gpu,optimal,3.219,0.005,2100.0,0,0.112,0.469
-5,170,3,28,0,cuopt-pdlp+round+mip,gpu,optimal,0.387,0.005,2100.0,0,0.073,0.073
-5,170,3,28,0,highs-simplex+round,cpu,feasible,0.134,0.005,2100.0,0,0.134,0.134
-5,170,3,28,0,highs-pdlp+round,cpu,feasible,0.132,0.005,3099.0,1,0.132,
-5,170,3,28,0,cuopt-pdlp+round,gpu,feasible,0.066,0.005,2100.0,0,0.066,0.066
+5,170,3,28,0,cuopt-pdlp+round+mip,gpu,optimal,0.056,0.003,2100.0,0,0.055,0.055
+5,170,3,28,0,highs-simplex+round,cpu,optimal,0.179,0.005,2100.0,0,0.178,0.178
+5,170,3,28,0,highs-pdlp+round,cpu,feasible,0.133,0.005,3099.0,1,0.132,
+5,170,3,28,0,cuopt-pdlp+round,gpu,optimal,0.108,0.005,2100.0,0,0.107,0.107

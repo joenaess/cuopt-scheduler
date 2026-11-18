@@ -65,12 +65,12 @@ Six methods, with cuOpt 26.10.1 and HiGHS 1.16 on an RTX 4080 Laptop GPU and an 
 |---|---|---|
 | `highs-mip` | CPU | HiGHS branch-and-bound, proves optimality |
 | `cuopt-mip` | GPU | cuOpt's MILP solver from scratch (tuned: presolve off, PDLP root LP) |
-| `cuopt-pdlp+round+mip` | GPU | **cuOpt PDLP + rounding, then cuOpt's MILP solver started from that schedule.** What the app uses. |
+| `cuopt-pdlp+round+mip` | GPU | **cuOpt PDLP + rounding, proven optimal by the LP bound; cuOpt's MILP solver, started from that schedule, runs only if the bound doesn't prove it.** What the app uses. |
 | `cuopt-pdlp+round` | GPU | cuOpt PDLP (Stable2 mode) on the LP relaxation, then greedy rounding |
 | `highs-pdlp+round` | CPU | the same with HiGHS's CPU PDLP |
 | `highs-simplex+round` | CPU | the same with HiGHS's dual simplex |
 
-LP + rounding works so well here because this model's LP bound equals the best schedule's cost, and rounding can never break a rule (`lp_round.py` explains why). It never proves optimality on its own; that is what handing the rounded schedule to cuOpt's MILP solver adds.
+LP + rounding works so well here because this model's LP bound equals the best schedule's cost, and rounding can never break a rule (`lp_round.py` explains why). It also proves optimality: the LP solver's duals give a guaranteed lower bound on the cost of any schedule (a Lagrangian bound, valid even for PDLP's approximate duals; see `ScheduleModel.lower_bound`). Costs are whole numbers, so a rounded schedule less than 1 above that bound is optimal. Every LP + rounding method uses this proof; only `cuopt-pdlp+round+mip` falls back to a MILP solver when it fails.
 
 ### Results
 
@@ -83,7 +83,7 @@ LP + rounding works so well here because this model's LP bound equals the best s
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/speedup-dark.png">
-  <img alt="GPU speed-up: best CPU method's time divided by best GPU method's time, against employees. Above 1 at every size: from 1.4 times at 170 employees to about 2.9 times at 10,880 at level 0, and 2 to 3.3 times at level 3." src="docs/img/speedup-light.png">
+  <img alt="GPU speed-up: best CPU method's time divided by best GPU method's time, against employees. Above 1 at every size: from 1.7 times at 170 employees to about 2.8 times at 10,880 at level 0, and 2.5 to 3.2 times at level 3." src="docs/img/speedup-light.png">
 </picture>
 
 <picture>
@@ -93,33 +93,52 @@ LP + rounding works so well here because this model's LP bound equals the best s
 
 Seconds to a schedule within 1% of the best (– = not within 1% by the 120 s limit; **bold** = fastest):
 
-| Employees | Level | HiGHS MILP (CPU) | cuOpt MILP (GPU) | cuOpt MILP from rounding (GPU) | HiGHS simplex + rounding (CPU) | HiGHS PDLP + rounding (CPU) | cuOpt PDLP + rounding (GPU) |
+| Employees | Level | HiGHS MILP (CPU) | cuOpt MILP (GPU) | cuOpt rounding, MILP if unproven (GPU) | HiGHS simplex + rounding (CPU) | HiGHS PDLP + rounding (CPU) | cuOpt PDLP + rounding (GPU) |
 |---|---|---|---|---|---|---|---|
-| 170 | 0 | 0.35 | 0.3 | **0.059** | 0.084 | 0.08 | **0.057** |
-| 170 | 3 | 1 | 0.47 | 0.073 | 0.13 | – | **0.066** |
-| 680 | 0 | 2.1 | 2.3 | **0.13** | 0.29 | 0.23 | **0.13** |
-| 680 | 3 | 4.7 | 4.6 | **0.16** | 0.76 | 0.41 | **0.17** |
-| 1,360 | 0 | 4.7 | 8.6 | **0.21** | 0.74 | 0.46 | **0.21** |
-| 1,360 | 3 | 14 | 19 | **0.3** | 3 | 0.87 | **0.3** |
-| 2,720 | 0 | 16 | 26 | **0.38** | 3 | 1 | **0.38** |
-| 2,720 | 1 | 36 | 66 | **0.56** | 17 | 1.6 | **0.57** |
-| 2,720 | 2 | 45 | 63 | **0.59** | 21 | 1.6 | **0.58** |
-| 2,720 | 3 | 46 | 41 | **0.56** | 23 | 1.8 | **0.56** |
-| 5,440 | 0 | 22 | 69 | **0.77** | 11 | 2.2 | **0.76** |
-| 5,440 | 3 | – | – | **1.1** | – | 3.2 | **1.1** |
-| 10,880 | 0 | 80 | 90 | 1.6 | 59 | 4.3 | **1.5** |
-| 10,880 | 3 | – | failed (GPU memory) | 2.5 | – | 6.6 | **2.2** |
+| 170 | 0 | 0.35 | 0.3 | **0.047** | 0.14 | 0.082 | 0.08 |
+| 170 | 3 | 1 | 0.47 | **0.055** | 0.18 | – | 0.11 |
+| 680 | 0 | 2.1 | 2.3 | **0.11** | 0.33 | 0.22 | 0.13 |
+| 680 | 3 | 4.7 | 4.6 | **0.16** | 0.78 | 0.4 | 0.17 |
+| 1,360 | 0 | 4.7 | 8.6 | **0.2** | 0.77 | 0.42 | **0.2** |
+| 1,360 | 3 | 14 | 19 | **0.29** | 2.8 | 0.81 | **0.29** |
+| 2,720 | 0 | 16 | 26 | 0.4 | 2.8 | 0.94 | **0.38** |
+| 2,720 | 1 | 36 | 66 | **0.56** | 14 | 1.4 | **0.54** |
+| 2,720 | 2 | 45 | 63 | **0.59** | 18 | 1.5 | **0.57** |
+| 2,720 | 3 | 46 | 41 | 0.58 | 21 | 1.7 | **0.55** |
+| 5,440 | 0 | 22 | 69 | **0.77** | 10 | 2 | **0.74** |
+| 5,440 | 3 | – | – | **1.2** | – | 3.2 | **1.2** |
+| 10,880 | 0 | 80 | 90 | **1.6** | 57 | 4.2 | **1.5** |
+| 10,880 | 3 | – | failed (GPU memory) | **2.4** | – | 6.7 | **2.5** |
 
-Regenerate with `uv run cuopt-plots docs/benchmarks/runs/*.csv --table`.
+Seconds to a **proven** optimal schedule (– = not proven by the 120 s limit):
+
+| Employees | Level | HiGHS MILP (CPU) | cuOpt MILP (GPU) | cuOpt rounding, MILP if unproven (GPU) | HiGHS simplex + rounding (CPU) | HiGHS PDLP + rounding (CPU) | cuOpt PDLP + rounding (GPU) |
+|---|---|---|---|---|---|---|---|
+| 170 | 0 | 0.36 | 1.5 | **0.047** | 0.14 | 0.083 | 0.083 |
+| 170 | 3 | 1 | 3.2 | **0.056** | 0.18 | – | 0.11 |
+| 680 | 0 | 2.1 | 6.1 | **0.11** | 0.33 | 0.22 | 0.13 |
+| 680 | 3 | 4.7 | 6.6 | **0.16** | 0.78 | 0.4 | 0.17 |
+| 1,360 | 0 | 5.2 | 9.8 | **0.21** | 0.77 | 0.42 | **0.2** |
+| 1,360 | 3 | 14 | 19 | **0.3** | 2.8 | 0.81 | **0.29** |
+| 2,720 | 0 | 16 | 27 | 0.41 | 2.8 | 0.95 | **0.39** |
+| 2,720 | 1 | 36 | 116 | 0.58 | 14 | 1.4 | **0.55** |
+| 2,720 | 2 | 45 | 115 | **0.61** | 18 | 1.5 | **0.59** |
+| 2,720 | 3 | 46 | 45 | 0.6 | 21 | 1.8 | **0.56** |
+| 5,440 | 0 | 22 | 96 | **0.79** | 10 | 2 | **0.76** |
+| 5,440 | 3 | – | – | **1.2** | – | 3.2 | **1.2** |
+| 10,880 | 0 | 83 | – | **1.6** | 57 | 4.2 | **1.6** |
+| 10,880 | 3 | – | failed (GPU memory) | **2.5** | – | – | **2.5** |
+
+Regenerate with `uv run cuopt-plots docs/benchmarks/runs/*.csv --table` (and `--table proof`).
 
 Full rows, including total times and objectives, are in [`docs/benchmarks/runs`](docs/benchmarks/runs); how cuOpt's settings were chosen is in [`docs/benchmarks/README.md`](docs/benchmarks/README.md).
 
 **What this shows**
 
-* **The GPU is faster to a good roster at every size and difficulty tested**, 1.4–3.3× faster than the best CPU method. The lead grows with size up to about 2,700 employees and then holds at about 3×. At 5,440 employees on the hardest rules, cuOpt has the optimal roster in 1.1 s; HiGHS PDLP + rounding needs 3.2 s, and HiGHS's MILP solver still had 2,414 shifts uncovered after 120 s.
-* **How you call cuOpt matters more than the GPU.** cuOpt's MILP solver from scratch is no faster than HiGHS here, and slower at scale (70 s vs 22 s at 5,440 employees). The same GPU solves the LP relaxation in under 1.5 s. Three settings made the difference, each measured in [`docs/benchmarks/README.md`](docs/benchmarks/README.md): presolve off (with 26.10's default presolve, a 1,360-employee level-3 solve took 51 s instead of 16 s), the Stable2 PDLP mode (twice as fast as the default here), and starting the MILP solver from the rounded schedule.
-* **Proving optimality is still CPU-bound.** Started from the rounded schedule, cuOpt proves it optimal without branching (zero nodes), but its root LP inside the MILP solver runs dual simplex on the CPU and takes up to 110 s at 2,720 employees, against 0.6 s for the standalone PDLP solve. From 2,720 employees HiGHS usually proves optimality first (at level 0: 16 vs 21 s at 2,720 employees, 22 vs 101 s at 5,440, 83 vs 123 s at 10,880); the warm-started cuOpt proof wins only at level 3, where HiGHS struggles. For a roster you need now, use the schedule; the proof can follow.
-* **GPU memory is the limit for cuOpt's MILP solver, not for PDLP.** At 10,880 employees on level 3, cuOpt's MILP solver from scratch ran out of the laptop GPU's 12 GB. Started from the rounded schedule in a fresh process it fit, and proved the optimum. In the same process just after that failure it failed too; it now keeps the rounded schedule instead of starting over on the CPU. PDLP + rounding needed 2.2 s at that size.
+* **The GPU is faster to a good roster at every size and difficulty tested**, 1.7–3.2× faster than the best CPU method. At level 0 the lead grows with size up to about 5,000 employees and then holds at about 2.8×. At 5,440 employees on the hardest rules, cuOpt has the optimal roster in 1.2 s; HiGHS PDLP + rounding needs 3.2 s, and HiGHS's MILP solver still had 2,414 shifts uncovered after 120 s.
+* **How you call cuOpt matters more than the GPU.** cuOpt's MILP solver from scratch is no faster than HiGHS here, and slower at scale (70 s vs 22 s at 5,440 employees). The same GPU solves the LP relaxation in about 1.5 s or less. What made the difference, each measured in [`docs/benchmarks/README.md`](docs/benchmarks/README.md): solving the LP relaxation with PDLP and rounding it, the Stable2 PDLP mode (twice as fast as the default here), proving the result with the LP bound, and, for the MILP solver, presolve off (with 26.10's default presolve, a 1,360-employee level-3 solve took 51 s instead of 16 s).
+* **The GPU also proves optimality, without a MILP solver.** The LP bound from cuOpt's PDLP duals proved the rounded schedule optimal on all 14 problems, adding 0.01–0.07 s. At 10,880 employees that is a proven optimum in 1.6 s (level 0) and 2.5 s (level 3); HiGHS's MILP solver needs 83 s at level 0 and proves nothing within 120 s at level 3, and before this, cuOpt's MILP solver took up to 123 s to prove the same schedule optimal when started from it (its root LP inside the MILP solver is slow). On the CPU the same proof works with HiGHS's exact simplex duals, but simplex itself is slow at scale (57 s at 10,880 employees); HiGHS PDLP's looser duals prove it except on two level-3 problems (170 and 10,880 employees), where its rounding also missed the optimum.
+* **GPU memory is the limit for cuOpt's MILP solver, not for PDLP.** At 10,880 employees on level 3, cuOpt's MILP solver from scratch ran out of the laptop GPU's 12 GB, while PDLP + rounding proved the optimum in 2.5 s. With the LP proof, the app's GPU path no longer needs the MILP solver on these problems; if it ever does and that runs out of memory, the rounded schedule is kept rather than starting over on the CPU.
 * **Harder rules slow the exact solvers far more than the LP route.** From level 0 to 3 at 2,720 employees, HiGHS's MILP time triples (16 → 46 s) while cuOpt PDLP + rounding goes from 0.38 to 0.56 s.
 
 Earlier versions of this README benchmarked cuOpt 25.10, where the CPU won at every size: its MILP solver took up to 96 s to a good schedule at 5,440 employees, MIP starts failed, and it sometimes reported "Optimal" with a ~100% gap. Neither problem showed up in 26.10, but both backends still count a result as optimal only if the solver's own bound backs it up.
@@ -165,7 +184,7 @@ cuopt-scheduler/
 2. **Modeling**: Formulates the problem as a Mixed-Integer Linear Program (MILP), built directly as numpy arrays (costs, bounds and a sparse constraint matrix in CSR form). No modelling library sits in between, so building even the largest benchmark model takes a fraction of a second.
    * *Objective*: First cover as much demand as possible (each uncovered slot costs 1000), then use as few shifts as possible.
    * *Constraints*: Staffing demand per skill (shortfall allowed but penalised), max hours per calendar week, at most one shift per day, and minimum rest between consecutive days' shifts. Higher difficulty levels add a maximum run of working days, a weekly cap on night shifts, and extra cost for disliked shifts. Unavailability is a variable bound rather than a constraint.
-3. **Solving**: The same arrays go to cuOpt's Python API on GPU, or to HiGHS (`highspy`) on CPU, which is also the fallback if cuOpt is unavailable or fails (for example when a very large problem doesn't fit in GPU memory). On the GPU, cuOpt first solves the LP relaxation with PDLP and rounds it into a valid schedule, then starts its MILP solver from that schedule (`solve(..., warm_start=False)` skips this). Both get the same stopping rules: the optional relative gap, and an absolute gap just under 1 (all costs are integers, so that already proves optimality). A result counts as a solution only if it passes our own check of every bound and constraint, regardless of the solver's status code. It is "optimal" only if the solver also proved it.
+3. **Solving**: The same arrays go to cuOpt's Python API on GPU, or to HiGHS (`highspy`) on CPU, which is also the fallback if cuOpt is unavailable or fails (for example when a very large problem doesn't fit in GPU memory). On the GPU, cuOpt first solves the LP relaxation with PDLP and rounds it into a valid schedule; if the bound from PDLP's duals doesn't already prove that schedule optimal, it starts its MILP solver from it (`solve(..., warm_start=False)` skips all this and runs the MILP solver from scratch). Both get the same stopping rules: the optional relative gap, and an absolute gap just under 1 (all costs are integers, so that already proves optimality). A result counts as a solution only if it passes our own check of every bound and constraint, regardless of the solver's status code. It is "optimal" only if the solver also proved it.
 4. **Visualization**: Results become pandas DataFrames rendered with Plotly.
 
 ## ⚠️ Troubleshooting
