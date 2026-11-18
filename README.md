@@ -176,4 +176,4 @@ cuopt-scheduler/
 
 ## 📄 License
 
-This project is open for educational and testing purposes.
+Licensed under the [Apache License 2.0](LICENSE).
