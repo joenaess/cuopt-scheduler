@@ -7,6 +7,10 @@ packing row (a sum of assignments <= a limit): assignments are only ever added w
 packing row they touch still has room. Demand rows have a slack column that absorbs any
 shortfall.
 
+The LP solver's duals also give a guaranteed lower bound (`ScheduleModel.lower_bound`). When
+the rounded schedule's cost is within the optimality gap of it (less than 1, since costs are
+whole numbers), the schedule is proven optimal without any MILP search.
+
 LP engines: HiGHS on the CPU (dual simplex or PDLP) and cuOpt's PDLP on the GPU.
 
 `warm_started_mip` goes one step further on the GPU: it hands the rounded schedule to
@@ -15,7 +19,9 @@ cuOpt's MILP solver as a starting point, which then only has to prove it (or imp
 
 from __future__ import annotations
 
+import math
 import time
+from dataclasses import dataclass
 from enum import StrEnum
 
 import numpy as np
@@ -26,6 +32,7 @@ from cuopt_scheduler.solver import (
     Backend,
     RawSolution,
     SolveResult,
+    _gap_closed,
     _quiet_stdout,
     _solve_cuopt,
     cuopt_data_model,
@@ -54,14 +61,22 @@ class LPEngine(StrEnum):
         return Backend.GPU if self is LPEngine.CUOPT_PDLP else Backend.CPU
 
 
-def solve_lp(model: ScheduleModel, engine: LPEngine, time_limit: float) -> FloatArray:
-    """The LP relaxation's (approximate, for PDLP) optimal solution."""
+@dataclass(frozen=True)
+class LPSolution:
+    primal: FloatArray
+    duals: FloatArray
+    """Row multipliers, for `ScheduleModel.lower_bound`."""
+
+
+def solve_lp(model: ScheduleModel, engine: LPEngine, time_limit: float) -> LPSolution:
+    """The LP relaxation's (approximate, for PDLP) optimal solution and duals."""
     if engine.backend is Backend.CPU:
         h = highs_model(model, time_limit, relax=True)
         if engine is LPEngine.HIGHS_PDLP:
             h.setOptionValue("solver", "pdlp")
         h.run()
-        return np.asarray(h.getSolution().col_value)
+        sol = h.getSolution()
+        return LPSolution(np.asarray(sol.col_value), np.asarray(sol.row_dual, dtype=np.float64))
 
     from cuopt.linear_programming import solver, solver_settings  # pyright: ignore[reportMissingImports]
 
@@ -73,7 +88,19 @@ def solve_lp(model: ScheduleModel, engine: LPEngine, time_limit: float) -> Float
         for name, value in CUOPT_PDLP_PARAMS.items():
             settings.set_parameter(name, value)
         solution = solver.Solve(dm, settings)
-    return np.asarray(solution.get_primal_solution(), dtype=np.float64)
+    return LPSolution(
+        np.asarray(solution.get_primal_solution(), dtype=np.float64),
+        np.asarray(solution.get_dual_solution(), dtype=np.float64),
+    )
+
+
+def lp_bound_proves(
+    model: ScheduleModel, values: FloatArray, lp: LPSolution, gap_rel: float | None
+) -> tuple[bool, float]:
+    """(proven, bound): whether the LP duals' bound proves `values` optimal (within gap_rel)."""
+    bound = model.lower_bound(lp.duals)
+    proven = math.isfinite(bound) and _gap_closed(float(model.cost @ values), bound, gap_rel)
+    return proven, bound
 
 
 def round_lp(model: ScheduleModel, lp: FloatArray) -> FloatArray:
@@ -123,31 +150,43 @@ def round_lp(model: ScheduleModel, lp: FloatArray) -> FloatArray:
 
 
 def solve_lp_round(
-    problem: Problem, engine: LPEngine = LPEngine.HIGHS, time_limit: float = 30
+    problem: Problem,
+    engine: LPEngine = LPEngine.HIGHS,
+    time_limit: float = 30,
+    gap_rel: float | None = None,
 ) -> SolveResult:
-    """Schedule `problem` by LP relaxation plus rounding. Never claims optimality."""
+    """Schedule `problem` by LP relaxation plus rounding. Optimal if the LP bound proves it."""
     start = time.perf_counter()
     model = build_model(problem)
     build_seconds = time.perf_counter() - start
 
     start = time.perf_counter()
-    values = round_lp(model, solve_lp(model, engine, time_limit))
+    lp = solve_lp(model, engine, time_limit)
+    values = round_lp(model, lp.primal)
+    first = time.perf_counter() - start
+    proven, bound = lp_bound_proves(model, values, lp, gap_rel)
     elapsed = time.perf_counter() - start
     objective = float(model.cost @ values)
-    raw = RawSolution(values, False, f"LP ({engine}) + rounding", ((elapsed, objective),))
+    status = f"LP ({engine}) + rounding, LP bound {bound:g}"
+    raw = RawSolution(values, proven, status, ((first, objective),))
     return _checked(make_result(model, raw, engine.backend, elapsed, build_seconds))
 
 
 def warm_started_mip(model: ScheduleModel, time_limit: float, gap_rel: float | None) -> RawSolution:
-    """cuOpt PDLP + rounding, then cuOpt's MILP solver starting from that schedule.
+    """cuOpt PDLP + rounding, then, unless the LP bound already proves that schedule
+    optimal, cuOpt's MILP solver starting from it.
 
     Has a good schedule as soon as the LP is solved, and can still prove it optimal. The
     time limit covers both steps. Used by `solve(..., Backend.GPU)`.
     """
     start = time.perf_counter()
-    rounded = round_lp(model, solve_lp(model, LPEngine.CUOPT_PDLP, time_limit))
+    lp = solve_lp(model, LPEngine.CUOPT_PDLP, time_limit)
+    rounded = round_lp(model, lp.primal)
+    first = ((time.perf_counter() - start, float(model.cost @ rounded)),)
+    proven, bound = lp_bound_proves(model, rounded, lp, gap_rel)
+    if proven:
+        return RawSolution(rounded, True, f"LP + rounding, proven by LP bound {bound:g}", first)
     t_lp = time.perf_counter() - start
-    first = ((t_lp, float(model.cost @ rounded)),)
     try:
         raw = _solve_cuopt(model, max(1.0, time_limit - t_lp), gap_rel, initial=rounded)
     except Exception as exc:

@@ -63,6 +63,32 @@ the MILP solver with `DataModel.set_initial_primal_solution`, which works for MI
 | 1,360 employees, level 3 | 18 s | 8.3 s |
 | 2,720 employees, level 0 | 27–29 s | 21 s |
 
+### Proving the rounded schedule optimal with the LP bound
+
+The MILP solver above spent nearly all its time proving a schedule that rounding had
+already found. The LP solver's duals give that proof directly: for any row multipliers y,
+`cost @ v >= y @ (row bounds) + sum_j min over the column's bounds of (cost - A.T y)_j v_j`
+for every valid v (weak duality, the Lagrangian bound), so PDLP's approximate duals are
+safe to use; they only need to be good enough to make the bound tight.
+`ScheduleModel.lower_bound` computes it, after zeroing multipliers that point at an infinite
+row bound and subtracting a floating-point error allowance. Costs are whole numbers, so a
+schedule less than 1 above the bound is optimal (the same absolute gap the MILP solvers get).
+
+Gap between the rounded schedule and the bound from cuOpt PDLP's (Stable2) duals:
+
+| Problem | PDLP + rounding + bound | Gap | Before: MILP from rounding, total |
+|---|---|---|---|
+| 170 employees, level 3 | 0.08 s | 0.27 | 0.39 s |
+| 2,720 employees, level 0 | 0.41 s | 0.53 | 21 s |
+| 2,720 employees, level 3 | 0.62 s | 0.74 | 30 s |
+| 5,440 employees, level 3 | 1.4 s | 0.01 | 121 s |
+| 10,880 employees, level 0 | 1.7 s | 0.81 | 123 s |
+| 10,880 employees, level 3 | 2.7 s | 0.00 | 123 s |
+
+All under 1, so every benchmark problem is proven optimal without the MILP solver, which
+`cuopt-pdlp+round+mip` now runs only as a fallback. The tables below, measured before this
+change, still label that method "MILP from rounding".
+
 ## cuOpt 26.12 nightly (checked 2026-11-18)
 
 `cuopt-cu13 26.12.00a101` from the RAPIDS nightly index passes the test suite, but is no

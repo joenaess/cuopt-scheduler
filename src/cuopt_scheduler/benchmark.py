@@ -66,7 +66,7 @@ class Method(StrEnum):
         """Solve with this method. A GPU method that had to fall back to the CPU returns
         that CPU result; `iter_benchmark` records it as failed."""
         if engine := self.lp_engine:
-            return solve_lp_round(problem, engine, time_limit)
+            return solve_lp_round(problem, engine, time_limit, gap_rel)
         return solve(
             problem,
             self.device,

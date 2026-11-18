@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -64,3 +65,23 @@ def test_markdown_table_marks_the_fastest_misses_and_failures() -> None:
     # 170 employees, level 0: HiGHS MILP 10 s, cuOpt MILP missed, rounding 1 s and 0.5 s.
     assert lines[2] == "| 170 | 0 | 10 | – |  |  | 1 | **0.5** |"
     assert "failed (GPU memory)" in lines[5]
+
+
+def test_markdown_table_of_time_to_a_proven_optimum() -> None:
+    df = rows()
+    proven = df["method"] == "highs-mip"
+    df.loc[proven, "outcome"] = "optimal"
+    lines = markdown_table(df, proof=True).splitlines()
+    # Only HiGHS MILP proved anything; the rest have a schedule but no proof.
+    assert lines[2] == "| 170 | 0 | **10** | – |  |  | – | – |"
+
+
+def test_a_method_that_never_got_close_counts_as_the_longest_run() -> None:
+    df = rows()
+    one = (df["wards"] == 5) & (df["level"] == 0)
+    # HiGHS PDLP + rounding finished first, but with a poor schedule.
+    poor = one & (df["method"] == "highs-pdlp+round")
+    df.loc[poor, ["near_seconds", "seconds"]] = [np.nan, 0.01]
+    s = gpu_speedup(df)
+    row = s[(s["wards"] == 5) & (s["level"] == 0)].iloc[0]
+    assert row["cpu"] == 10.0  # HiGHS MILP's time, not the poor run's 0.01 s

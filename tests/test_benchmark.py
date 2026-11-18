@@ -52,7 +52,10 @@ def test_benchmark_cpu_methods() -> None:
     assert {r.device for r in rows} == {"cpu"}
     mip = [r for r in rows if r.method == Method.HIGHS_MIP]
     assert all(r.outcome == "optimal" and r.uncovered == 0 for r in mip)
-    assert all(r.outcome == "feasible" for r in rows if r.method != Method.HIGHS_MIP)
+    # LP + rounding is optimal when the LP bound proves it; HiGHS simplex's exact duals do.
+    simplex = [r for r in rows if r.method == Method.HIGHS_SIMPLEX_ROUND]
+    assert all(r.outcome == "optimal" for r in simplex)
+    assert all(r.outcome in ("optimal", "feasible") for r in rows)
     # Alone, each run is its own best: it reaches "near" no later than it finishes.
     for r in rows:
         assert r.seconds is not None
